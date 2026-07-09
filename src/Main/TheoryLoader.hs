@@ -43,7 +43,7 @@ import Data.Char (toLower)
 import Data.FileEmbed (embedFile)
 import Data.List (find, intercalate, isPrefixOf)
 import Data.Map (keys)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified
 import Debug.Trace
 import Export qualified
@@ -84,7 +84,12 @@ import TheoryObject (diffTheoryConfigBlock, theoryConfigBlock)
 -- | Flags for loading a theory.
 theoryLoadFlags :: [Flag Arguments]
 theoryLoadFlags =
-  [ flagOpt
+  [ flagReq
+      ["evict"]
+      (updateArg "evict")
+      "DIR"
+      "store each expanded proof step's system in DIR/store.bin and drop it from memory, keeps peak memory down (see --json-store to view it as JSON)",
+    flagOpt
       ""
       ["prove"]
       (updateArg "prove")
@@ -218,7 +223,8 @@ data TheoryLoadOptions = TheoryLoadOptions
     derivationChecks :: Int,
     noReuse :: Bool,
     noRestrictions :: Bool,
-    replicationBound :: Int
+    replicationBound :: Int,
+    evictDir :: Maybe FilePath          -- ^ --evict: spill+drop systems during the search
   }
   deriving (Show)
 
@@ -246,7 +252,8 @@ defaultTheoryLoadOptions =
       derivationChecks = 5,
       noReuse = False,
       noRestrictions = False,
-      replicationBound = 3
+      replicationBound = 3,
+      evictDir = Nothing
     }
 
 toParserFlags :: TheoryLoadOptions -> [String]
@@ -284,9 +291,12 @@ mkTheoryLoadOptions as =
     <*> noReuse
     <*> noRestrictions
     <*> replicationBound
+    <*> evictDir
   where
     proveMode = pure $ argExists "prove" as
     lemmaNames = pure $ findArg "prove" as ++ findArg "lemma" as
+
+    evictDir = pure (findArg "evict" as :: Maybe FilePath)
 
     parseIntArg args defaultValue conv errMsg = case args of
       [] -> pure defaultValue
@@ -704,6 +714,7 @@ constructAutoProver thyOpts =
     thyOpts.proofBound
     (fromMaybe CutDFS thyOpts.stopOnTrace)
     thyOpts.oracleOnly
+    (isJust thyOpts.evictDir)
 
 -----------------------------------------------
 -- Add Options parameters in an OpenTheory

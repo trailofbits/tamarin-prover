@@ -28,6 +28,8 @@ import Theory hiding (closeTheory)
 import Theory.Module
 import Theory.Tools.Wellformedness (prettyWfErrorReport)
 
+import Theory.Constraint.Solver.Store (initStore, closeStore, dumpStoreJSON)
+import Theory.Constraint.Solver.TreeExport (writeLemmaTrees)
 import Main.Console
 import Main.Environment
 import Main.TheoryLoader
@@ -64,6 +66,10 @@ batchMode = tamarinMode
 
               , flagNone ["precompute-only"] (addEmptyArg "precomputeOnly")
                   "Just run precomputation and show partial deconstructions"
+
+              , flagReq ["json-store"] (updateArg "jsonStore") "DIR"
+                  "write DIR/store.jsonl, a readable JSON view of DIR/store.bin (works even on a crashed run)"
+
               ] ++
               outputFlags ++
               toolFlags
@@ -86,6 +92,9 @@ batchMode = tamarinMode
 -- | Process a theory file.
 run :: TamarinMode -> Arguments -> IO ()
 run thisMode as
+  | Just dumpDir <- findArg "jsonStore" as :: Maybe FilePath, null inFiles = do
+      path <- dumpStoreJSON dumpDir
+      putStrLn ("wrote " ++ path)
   | null inFiles = helpAndExit thisMode (Just "no input files given")
   | argExists "parseOnly" as = do
       res <- mapM (processThy "") inFiles
@@ -112,6 +121,7 @@ run thisMode as
         mapM_ (putStrLn . renderDoc) docs
   | otherwise = do
       versionData <- ensureMaudeAndGetVersion as
+      mapM_ initStore thyLoadOptions.evictDir
       resTimed <- mapM (timedIO . processThy versionData) inFiles
       let (docs, reps, times) = unzip3 $ fmap (\((d, r), t) -> (d, r, t)) resTimed
 
@@ -131,6 +141,12 @@ run thisMode as
 
         mapM_ (putStrLn . renderDoc) docs
         putStrLn $ renderDoc $ ppSummary summary
+
+      closeStore
+      mapM_ (\d -> do
+               path <- dumpStoreJSON d
+               putStrLn ("wrote " ++ path))
+            (findArg "jsonStore" as :: Maybe FilePath)
 
   where
     ppSummary summary = Pretty.vcat [ Pretty.text ""
@@ -223,6 +239,10 @@ run thisMode as
       else do
         (report, thy') <- closeTheory versionData thyLoadOptions sig' thy
         _ <- liftIO $ bitraverse outputTraces (const $ return ()) thy'
+        liftIO $ mapM_ (\dir -> case thy' of
+                                  Left closedThy -> writeLemmaTrees dir closedThy
+                                  Right _        -> putStrLn "checkpoint: diff theories are not supported")
+                       thyLoadOptions.evictDir
 
         pure $
           either (\t -> (prettyClosedTheory t,     ppWf report Pretty.$--$ prettyClosedSummary t))
@@ -281,7 +301,7 @@ run thisMode as
             -- | Collect all solved (i.e. a trace was found) systems of the theory along with their
             -- path in the proof.
             proofSystems :: IncrementalProof -> [(ProofPath, System)]
-            proofSystems (LNode (ProofStep (Finished Solved) (Just rootSystem)) _) =  [([], rootSystem)]
+            proofSystems (LNode (ProofStep (Finished Solved) (Just ref)) _) | Just rootSystem <- viewSystem ref =  [([], rootSystem)]
             proofSystems (LNode (ProofStep _ _) children) =  
               [(l : ls, system) | (l, subProof) <- M.toList children 
                                 , (ls, system) <- proofSystems subProof ]

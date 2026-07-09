@@ -85,7 +85,7 @@ applyMethodAtPath thy lemmaName proofPath prover i = do
     lemma <- lookupLemma lemmaName thy
     subProof <- lemma._lProof `atPath` proofPath
     let ctxt  = getProofContext lemma thy
-        sys   = psInfo (root subProof)
+        sys   = psInfo (root subProof) >>= memSystem
         heuristic = selectHeuristic prover ctxt
         ranking = useHeuristic heuristic (length proofPath)
         tactic = selectTactic prover ctxt
@@ -101,7 +101,7 @@ applyMethodAtPathDiff thy s lemmaName proofPath prover i = do
     lemma <- lookupLemmaDiff s lemmaName thy
     subProof <- lemma._lProof `atPath` proofPath
     let ctxt  = getProofContextDiff s lemma thy
-        sys   = psInfo (root subProof)
+        sys   = psInfo (root subProof) >>= memSystem
         heuristic = selectHeuristic prover ctxt
         ranking = useHeuristic heuristic (length proofPath)
         tactic = selectTactic prover ctxt
@@ -225,7 +225,7 @@ proofIndex :: HtmlDocument d
            -> Int
            -> RenderUrl
            -> (ProofPath -> Route WebUI)         -- ^ Relative addressing function
-           -> Proof (Maybe System, ProofStepColor) -- ^ The annotated incremental proof
+           -> Proof (Maybe SystemRef, ProofStepColor) -- ^ The annotated incremental proof
            -> d
 proofIndex l tidx renderUrl mkRoute =
     prettyProofWith ppStep ppCase . insertPaths
@@ -521,7 +521,7 @@ subProofSnippet :: HtmlDocument d
                 -> IncrementalProof          -- ^ The sub-proof.
                 -> d
 subProofSnippet renderUrl renderImgUrl tidx ti lemma proofPath ctxt prf =
-    case psInfo $ root prf of
+    case psInfo (root prf) >>= memSystem of
       Nothing -> text $ "no annotated constraint system / " ++ nCases ++ " sub-case(s)"
       Just se -> vcat $
         prettyApplicableProofMethods se
@@ -623,7 +623,7 @@ subProofDiffSnippet :: HtmlDocument d
                     -> IncrementalProof          -- ^ The sub-proof.
                     -> d
 subProofDiffSnippet renderUrl tidx ti s lemma proofPath ctxt prf =
-    case psInfo $ root prf of
+    case psInfo (root prf) >>= memSystem of
       Nothing -> text $ "no annotated constraint system / " ++ nCases ++ " sub-case(s)"
       Just se -> vcat $
         prettyApplicableProofMethods se
@@ -1332,7 +1332,7 @@ imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
     proofPathSystem lemma proofPath = do
       let jsonLabel = "Theory: " ++ thy._thyName ++ " Lemma: " ++ lemma
       subProof <- resolveProofPath thy lemma proofPath
-      sequent <- psInfo $ root subProof
+      sequent <- psInfo (root subProof) >>= memSystem
       return (jsonLabel, sequent)
 
     -- | Prefix dot code with comment mentioning all protocol rule names
@@ -1452,7 +1452,7 @@ imgDiffThyPath imgFormat dotCommand cacheDir_ compact thy path mirror = case pat
     proofPathDotCode s lemma proofPath =
       D.showDot "G" $ fromMaybe (return ()) $ do
         subProof <- resolveProofPathDiff thy s lemma proofPath
-        sequent <- psInfo $ root subProof
+        sequent <- psInfo (root subProof) >>= memSystem
         return $ compact sequent
 
     -- Get dot code for proof path in lemma
@@ -1561,7 +1561,7 @@ interactiveDotDiffThyPath compact thy path mirror = go path
     proofPathDotCode s lemma proofPath =
       D.showDot "G" $ fromMaybe (return ()) $ do
         subProof <- resolveProofPathDiff thy s lemma proofPath
-        sequent <- psInfo $ root subProof
+        sequent <- psInfo (root subProof) >>= memSystem
         return $ compact sequent
 
     -- Get dot code for proof path in lemma
@@ -2145,7 +2145,7 @@ getPrevElement f (x:xs) = go x xs
 
 -- | Translate a proof status returned by 'annotateLemmaProof' to a
 -- corresponding CSS class.
-markStatus :: HtmlDocument d => (Maybe System, ProofStepColor) -> d -> d
+markStatus :: HtmlDocument d => (Maybe SystemRef, ProofStepColor) -> d -> d
 markStatus (Nothing, _       ) = withTag "span" [("class","hl_superfluous")]
 markStatus (Just _,  Green   ) = withTag "span" [("class","hl_good")]
 markStatus (Just _,  Red     ) = withTag "span" [("class","hl_bad")]
@@ -2168,7 +2168,7 @@ data ProofStepColor = Unmarked | Green | Red | Yellow
 -- The boolean flag indicates that the given proof step's children
 -- are (a) all annotated and (b) contain no sorry steps.
 annotateLemmaProof :: Lemma IncrementalProof
-                   -> Proof (Maybe System, ProofStepColor)
+                   -> Proof (Maybe SystemRef, ProofStepColor)
 annotateLemmaProof lem =
 --     error (show (get lProof lem) ++ " - " ++ show prf)
     mapProofInfo (second interpret) prf
@@ -2239,5 +2239,5 @@ dotGraphString toDot thy thyPath = do
     proofPathSystem lemma proofPath = do
       let jsonLabel = "Theory: " ++ thy._thyName ++ " Lemma: " ++ lemma
       subProof <- resolveProofPath thy lemma proofPath
-      sequent <- psInfo $ root subProof
+      sequent <- psInfo (root subProof) >>= memSystem
       return (jsonLabel, sequent)

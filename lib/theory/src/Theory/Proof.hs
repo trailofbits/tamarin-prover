@@ -57,6 +57,9 @@ module Theory.Proof (
   -- ** Incremental proof construction
   , IncrementalProof
   , IncrementalDiffProof
+  , SystemRef(..)
+  , memSystem
+  , viewSystem
   , Prover
   , DiffProver
   , runProver
@@ -112,6 +115,8 @@ import qualified Data.Map                         as M
 import           Data.Maybe
 -- import           Data.Monoid
 
+import           System.IO.Unsafe                 (unsafePerformIO)
+
 import           Debug.Trace
 
 import           Control.Basics
@@ -120,6 +125,7 @@ import qualified Control.Monad.State              as S
 import           Control.Parallel.Strategies
 
 import           Theory.Constraint.Solver
+import           Theory.Constraint.Solver.Store   (Ref, readSystemLiveMaybe, storeSystem)
 import           Theory.Model
 import           Theory.Text.Pretty
 
@@ -257,10 +263,10 @@ unproven = sorry Nothing
 
 -- | A proof denoting an unproven part of the proof.
 unprovenLookAhead :: ProofContext -> System -> IncrementalProof
-unprovenLookAhead ctxt sys = maybe (sorry Nothing (Just sys)) toNode (isFinished ctxt sys)
+unprovenLookAhead ctxt sys = maybe (sorry Nothing (Just (InMem sys))) toNode (isFinished ctxt sys)
   where
     toNode :: Result -> IncrementalProof
-    toNode r = LNode (ProofStep (Finished r) (Just sys)) M.empty
+    toNode r = LNode (ProofStep (Finished r) (Just (InMem sys))) M.empty
 
 -- | A proof denoting an unproven part of the proof.
 diffUnproven :: a -> DiffProof a
@@ -445,11 +451,11 @@ diffProofStepStatus (DiffProofStep _                (Just _)) = CompleteProof
 -- proof step without an annotated sequent. An unhandled case is denoted using
 -- the 'Sorry' proof method.
 checkProof :: ProofContext
-           -> (Int -> System -> Proof (Maybe System)) -- prover for new cases in depth
+           -> (Int -> System -> Proof (Maybe SystemRef)) -- prover for new cases in depth
            -> Int         -- ^ Original depth
            -> System
            -> Proof a
-           -> Proof (Maybe a, Maybe System)
+           -> Proof (Maybe a, Maybe SystemRef)
 checkProof ctxt prover =
     go
   where
@@ -462,7 +468,7 @@ checkProof ctxt prover =
         unhandledCase = mapProofInfo (Nothing,) . prover d
         checkChildren cases = mergeMapsWith unhandledCase noSystemPrf (go (d + 1)) cases cs
 
-        node m                 = LNode (ProofStep m (Just info, Just sys))
+        node m                 = LNode (ProofStep m (Just info, Just (InMem sys)))
         sorryNode reason cases = node (Sorry reason) (M.map noSystemPrf cases)
         noSystemPrf            = mapProofInfo (\i -> (Just i, Nothing))
 
@@ -497,9 +503,28 @@ checkDiffProof ctxt prover =
 -- Provers: the interface to the outside world.
 ------------------------------------------------------------------------------
 
+-- | A node's constraint System: either sitting in memory, or evicted to the
+-- store and reloadable via its Ref. Proof-status/solution code treats OnDisk
+-- as "present" same as InMem -- only a genuinely unexpanded node is Nothing.
+data SystemRef = InMem System | OnDisk Ref
+    deriving( Eq, Ord, Show, Generic, NFData, Binary )
+
+-- | The system if it's still in memory, Nothing if it got evicted.
+memSystem :: SystemRef -> Maybe System
+memSystem (InMem sys) = Just sys
+memSystem (OnDisk _)  = Nothing
+
+-- | The system at a node, reading evicted ones back from the store. This is
+-- what the GUI uses -- pay reload latency instead of keeping everything in
+-- memory. Nothing only if there's no store open to read from.
+viewSystem :: SystemRef -> Maybe System
+viewSystem (InMem sys) = Just sys
+viewSystem (OnDisk r)  = unsafePerformIO (readSystemLiveMaybe r)
+{-# NOINLINE viewSystem #-}
+
 -- | Incremental proofs are used to represent intermediate results of proof
 -- checking/construction.
-type IncrementalProof = Proof (Maybe System)
+type IncrementalProof = Proof (Maybe SystemRef)
 
 -- | Incremental diff proofs are used to represent intermediate results of proof
 -- checking/construction.
@@ -582,7 +607,7 @@ tryProver =  (`orelse` mempty)
 oneStepProver :: ProofMethod -> Prover
 oneStepProver method = Prover $ \ctxt _ se _ -> do
     cases <- execProofMethod ctxt method se
-    return $ LNode (ProofStep method (Just se)) (M.map (unprovenLookAhead ctxt) cases)
+    return $ LNode (ProofStep method (Just (InMem se))) (M.map (unprovenLookAhead ctxt) cases)
 
 -- | Try to execute one proof step using the given proof method.
 oneStepDiffProver :: DiffProofMethod -> DiffProver
@@ -592,7 +617,7 @@ oneStepDiffProver method = DiffProver $ \ctxt _ se _ -> do
 
 -- | Replace the current proof with a sorry step and the given reason.
 sorryProver :: Maybe String -> Prover
-sorryProver reason = Prover $ \_ _ se _ -> return $ sorry reason (Just se)
+sorryProver reason = Prover $ \_ _ se _ -> return $ sorry reason (Just (InMem se))
 
 -- | Replace the current proof with a sorry step and the given reason.
 sorryDiffProver :: Maybe String -> DiffProver
@@ -606,7 +631,7 @@ focus path prover =
         modifyAtPath (prover' ctxt (d + length path)) path prf
   where
     prover' ctxt d prf = do
-        se <- psInfo (root prf)
+        se <- psInfo (root prf) >>= memSystem
         runProver prover ctxt d se prf
 
 -- | Apply a diff prover only to a sub-proof, fails if the subproof doesn't exist.
@@ -644,7 +669,7 @@ replaceSorryProver prover0 = Prover prover
   where
     prover ctxt d _ = return . replace
       where
-        replace prf@(LNode (ProofStep (Sorry _) (Just se)) _) =
+        replace prf@(LNode (ProofStep (Sorry _) (Just (InMem se))) _) =
             fromMaybe prf $ runProver prover0 ctxt d se prf
         replace (LNode ps cases) =
             LNode ps $ M.map replace cases
@@ -699,6 +724,7 @@ data AutoProver = AutoProver
     , apBound            :: Maybe Int
     , apCut              :: SolutionExtractor
     , quitOnEmptyOracle  :: Bool
+    , apEvict            :: Bool  -- ^ store each expanded system and drop it
     }
     deriving ( Generic, NFData, Binary )
 
@@ -728,7 +754,7 @@ selectDiffTactic prover ctx = fromMaybe [defaultTactic]
                                  (apDefaultTactic prover <|> L.get pcTactic (L.get dpcPCLeft ctx))
 
 runAutoProver :: AutoProver -> Prover
-runAutoProver aut@(AutoProver _ _  bound cut _) =
+runAutoProver aut@(AutoProver _ _  bound cut _ evict) =
     mapProverProof cutSolved $ maybe id boundProver bound autoProver
   where
     cutSolved = case cut of
@@ -742,7 +768,7 @@ runAutoProver aut@(AutoProver _ _  bound cut _) =
     -- tries to find one by itself.
     autoProver :: Prover
     autoProver = Prover $ \ctxt depth sysPath _ ->
-        return $ proveSystemDFS (selectHeuristic aut ctxt) (selectTactic aut ctxt) ctxt depth sysPath
+        return $ proveSystemDFS evict (selectHeuristic aut ctxt) (selectTactic aut ctxt) ctxt depth sysPath
 
     -- | Bound the depth of proofs generated by the given prover.
     boundProver :: Int -> Prover -> Prover
@@ -750,7 +776,7 @@ runAutoProver aut@(AutoProver _ _  bound cut _) =
         boundProofDepth b <$> runProver p ctxt d se prf
 
 runAutoDiffProver :: AutoProver -> DiffProver
-runAutoDiffProver aut@(AutoProver _ _ bound cut _) =
+runAutoDiffProver aut@(AutoProver _ _ bound cut _ _) =
     mapDiffProverDiffProof cutSolved $ maybe id boundProver bound autoProver
   where
     cutSolved = case cut of
@@ -1014,9 +1040,10 @@ cutAfterFirstSorryDiff = snd . go False
 -- constraint system using a depth-first-search strategy to resolve the
 -- non-determinism wrt. what goal to solve next.  This proof can be of
 -- infinite depth, if the proof strategy loops.
-proveSystemDFS :: Heuristic ProofContext -> [Tactic ProofContext] -> ProofContext -> Int -> System -> Proof (Maybe System)
-proveSystemDFS heuristic tactics ctxt =
-    prove
+proveSystemDFS :: Bool -> Heuristic ProofContext -> [Tactic ProofContext] -> ProofContext -> Int -> System -> Proof (Maybe SystemRef)
+proveSystemDFS evict heuristic tactics ctxt depth0 sys0
+    | evict     = proveFrontier depth0 sys0
+    | otherwise = prove depth0 sys0
   where
     prove !depth sys =
         case rankProofMethods (useHeuristic heuristic depth) tactics ctxt sys of
@@ -1025,7 +1052,39 @@ proveSystemDFS heuristic tactics ctxt =
           (method, (cases, _expl)):_      -> node method cases
       where
         node method cases =
-          LNode (ProofStep method (Just sys)) (M.map (prove (succ depth)) cases)
+          LNode (ProofStep method (Just (InMem sys))) (M.map (prove (succ depth)) cases)
+
+    -- frontier eviction: force the children first (so they stop referencing
+    -- 'sys' lazily), then store 'sys' and keep only its ref. children stay in
+    -- memory till we visit them -- no disk reads needed, but memory grows
+    -- with however wide the unexplored frontier gets.
+    proveFrontier !depth sys =
+        case rankProofMethods (useHeuristic heuristic depth) tactics ctxt sys of
+          [] | finishedSubterms ctxt sys  -> node (Finished Solved) M.empty
+          []                              -> node (Finished Unfinishable) M.empty
+          (method, (cases, _expl)):_      -> node method cases
+      where
+        node method cases =
+          let !ref = deepseq cases (storeRef (M.size cases) sys)
+          in LNode (ProofStep method (Just (OnDisk ref)))
+                   (M.map (proveFrontier (succ depth)) cases)
+
+
+-- | Stores a System in the eviction log as a side effect of forcing its Ref.
+-- Also fires an "expand <ref> kids=... snodes=... sgoals=..." eventlog event
+-- (turn on with +RTS -l) -- join it against the tree files' refs and you get
+-- per-node timing, branching factor and system size, i.e. how the search
+-- actually went.
+storeRef :: Int -> System -> Ref
+storeRef nkids sys = unsafePerformIO $ do
+    ref <- storeSystem sys
+    traceEventIO ("expand " ++ show ref
+                  ++ " kids=" ++ show nkids
+                  ++ " snodes=" ++ show (M.size (L.get sNodes sys))
+                  ++ " sgoals=" ++ show (M.size (L.get sGoals sys)))
+    pure ref
+{-# NOINLINE storeRef #-}
+
 
 -- | @proveSystemDFS rules se@ explores all solutions of the initial
 -- constraint system using a depth-first-search strategy to resolve the

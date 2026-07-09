@@ -29,6 +29,8 @@ import Web.Types (OutputCommand(..), OutputFormat(..))
 import Main.Console
 import Main.Environment
 import Main.TheoryLoader
+import Theory.Constraint.Solver.Store (initStore)
+import Theory.Proof (AutoProver(..))
 
 
 ------------------------------------------------------------------------------
@@ -90,6 +92,9 @@ run thisMode as = case findArg "workDir" as of
           OutDot  -> ensureGraphVizDot as
           OutJSON -> ensureGraphCommand as
 
+      -- open the store so tree files get written after each step
+      mapM_ initStore (findArg "evict" as :: Maybe FilePath)
+
       port <- readPort
       let webUrl = serverUrl port
       putStrLn $ intercalate "\n"
@@ -115,7 +120,8 @@ run thisMode as = case findArg "workDir" as of
         (closeTheory version thyLoadOptions)
 
         (argExists "debug" as) (readOutputCommand as) readImageFormat
-        (constructAutoProver thyLoadOptions)
+        -- interactive mode never evicts, so autoprove and manual steps behave the same
+        (constructAutoProver thyLoadOptions) { apEvict = False }
         (runWarp port)
 
     else

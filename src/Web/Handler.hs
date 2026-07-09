@@ -60,9 +60,11 @@ module Web.Handler
   )
 where
 
+import Theory.Constraint.Solver.TreeExport (writeLemmaTrees)
 import Theory
   ( Theory(..), DiffTheory(..), ClosedTheory, ClosedDiffTheory, Side
   , ClosedTheory, ClosedDiffTheory, Side, Signature(..)
+  , SystemRef(..)
   , removeLemma
   , lookupLemmaIndex
   , addLemmaAtIndex
@@ -263,7 +265,7 @@ addLemma idx maybelemmaIndex (Lemma n pt _ tq f ofm a lp) = withTheory idx $ \ti
             case maybelemmaIndex of
                 Nothing -> pure $ Left "Lemma not found"
                 Just lemmaIndex -> do
-                    let newThy = addLemmaAtIndex (Lemma n pt True tq f ofm a $ unproven (Just gsys)) lemmaIndex ti.theory
+                    let newThy = addLemmaAtIndex (Lemma n pt True tq f ofm a $ unproven (Just (InMem gsys))) lemmaIndex ti.theory
                     case newThy of
                          Nothing -> pure $ Left "lemma editing failed"
                          (Just nthy) -> Right <$> replaceTheory (Just ti) Nothing nthy ("modified" ++ show idx) idx
@@ -315,6 +317,8 @@ replaceTheory parent origin thy rep idx = do
               TheoryInfo idx thy time parentIdx False (fromJust newOrigin)
                       (maybe yesod.defaultAutoProver (.autoProver) parent) rep)
       storeTheory yesod newThy idx
+      -- write tree files after every step so external tools can read them
+      mapM_ (\dir -> writeLemmaTrees dir thy) yesod.thyOpts.evictDir
       pure (M.insert idx newThy theories, idx)
 
 -- | Replace a diff theory at the given index (backward compatibility wrapper).
@@ -357,6 +361,8 @@ putTheory parent origin thy rep = do
             TheoryInfo idx thy time parentIdx False (fromJust newOrigin)
                     (maybe yesod.defaultAutoProver (.autoProver) parent) rep)
     storeTheory yesod newThy idx
+    -- write tree files after every step so external tools can read them
+    mapM_ (\dir -> writeLemmaTrees dir thy) yesod.thyOpts.evictDir
     pure (M.insert idx newThy theories, idx)
 
 -- | Store a theory, return index.
