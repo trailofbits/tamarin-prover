@@ -92,7 +92,7 @@ run thisMode as = case findArg "workDir" as of
           OutDot  -> ensureGraphVizDot as
           OutJSON -> ensureGraphCommand as
 
-      -- open the store so tree files get written after each step
+      -- Open the store requested for proof-state eviction.
       mapM_ initStore (findArg "evict" as :: Maybe FilePath)
 
       port <- readPort

@@ -57,6 +57,7 @@ library
     exceptions,
     fclabels,
     filepath,
+    memory,
     mtl,
     parallel,
     parsec,
@@ -70,7 +71,9 @@ library
     tamarin-prover-utils,
     text,
     transformers,
-    uniplate
+    uniplate,
+    unix,
+    unix-bytestring
 
   hs-source-dirs: src
   exposed-modules:

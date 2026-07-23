@@ -1,24 +1,23 @@
-{-# LANGUAGE DeriveGeneric     #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings   #-}
 
 -- |
 -- A content-addressed, append-only log for spilled proof state.
 --
--- Every value is written once, as one record:
+--   > ["tamarin-store-v2\n"]
+--   > [kind : 1B][key : 32B][len : 8B BE][payload]
 --
---   > [kind : 1B][ref : 64B hex][len : 8B BE][payload]
+-- Values hash their payload. Method edges and lemma roots hash the subject
+-- used to look them up. The kind is included in both hashes.
 --
--- The 'Ref' is the SHA-256 of the value's binary encoding (salted with its
--- 'Kind' so two types can't collide). It's stored in the record itself, so
--- rebuilding the index on load is one scan, no re-hashing. Use 'dumpStoreJSON'
--- to get a readable JSON view.
+-- One MVar serializes writes. Readers use pread and do not take the lock.
+-- The index is published only after a complete record was written.
 --
--- Writes are write-through: append it, forget it, never keep it in the heap.
--- The only thing we hold onto is the set of refs we've already seen.
+-- On startup we scan the log and truncate an incomplete tail. We do not
+-- provide power-loss durability or continue after a write error.
 --
--- Everything hangs off one global, 'globalStore', because the prover is pure
--- and there's no IO seam to pass a handle through. 'initStore' sets it up
--- once at the CLI layer.
+-- The store is global because the prover does not expose an IO handle.
 module Theory.Constraint.Solver.Store
   ( Ref
   , refText
@@ -27,62 +26,86 @@ module Theory.Constraint.Solver.Store
   , closeStore
   , writeOnce
   , storeSystem
+  , readSystemLive
   , readSystemLiveMaybe
   , dumpStoreJSON
+  , StoredRecord(..)
+  , readStoreRecords
+  , writeStoreJSON
+  , decodeStoredRecord
+  , valueRef
+  , MethodEdge(..)
+  , storeProofStep
+  , readProofStepMaybe
+  , LemmaRoot(..)
+  , LemmaMetadata(..)
+  , recordLemmaRoot
+  , readLemmaRootMaybe
   ) where
 
 import           Theory.Constraint.System
 import           Theory.Model
 import           Theory.Constraint.Solver.JSON ()   -- ToJSON for the System closure
+import           Theory.Constraint.Solver.ProofMethod (ProofMethod, CaseName)
 import           Control.DeepSeq         (NFData (rnf))
 
-import           Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
+import           Control.Concurrent.MVar (MVar, modifyMVarMasked, newMVar)
 import           Control.Exception       (evaluate)
-import           Control.Monad           (unless)
+import           Control.Monad           (unless, when)
 import           Crypto.Hash             (Digest, SHA256, hashlazy)
 import           Data.Aeson              (ToJSON, object, (.=))
 import qualified Data.Aeson              as A
 import qualified Data.Binary             as Bin
+import           Data.Binary.Get         (getByteString)
+import           Data.Binary.Put         (putByteString)
+import qualified Data.ByteArray          as BA
 import qualified Data.ByteString         as BS
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy    as BL
-import           Data.IORef              (IORef, newIORef, readIORef, writeIORef)
+import           Data.IORef              (IORef, atomicWriteIORef, newIORef,
+                                          readIORef, writeIORef)
 import           Data.Word               (Word64)
 import           GHC.Generics            (Generic)
+import           GHC.IO.Handle.Lock      (LockMode (ExclusiveLock), hTryLock)
 import qualified Data.Map                as M
 import qualified Data.Set                as S
 import qualified Data.Text               as T
 import qualified Data.Text.Encoding      as TE
-import qualified Extension.Data.Label    as L
 import           System.Directory        (createDirectoryIfMissing)
 import           System.FilePath         ((</>))
-import           System.IO               (BufferMode (BlockBuffering), Handle,
-                                          IOMode (ReadWriteMode),
+import           System.IO               (Handle, IOMode (ReadWriteMode),
                                           SeekMode (AbsoluteSeek), hClose,
-                                          hFileSize, hSeek,
-                                          hSetBuffering, openFile)
+                                          hFileSize, hFlush, hSeek,
+                                          hSetFileSize, openFile)
 import           System.IO.Unsafe        (unsafePerformIO)
+import           System.Posix.IO         (closeFd, handleToFd)
+import           System.Posix.IO.ByteString.Ext (fdPread, fdPwrite)
+import           System.Posix.Types      (ByteCount, Fd, FileOffset)
 
--- | Content address of a stored value: hex SHA-256 of its binary encoding.
-newtype Ref = Ref T.Text
-  deriving (Eq, Ord, Show)
+-- | A raw SHA-256 key. 'refText' renders it as hex.
+newtype Ref = Ref BS.ByteString
+  deriving (Eq, Ord)
 
+instance Show Ref where show = T.unpack . refText
+
+-- | Render a ref as hex.
 refText :: Ref -> T.Text
-refText (Ref t) = t
+refText (Ref keyBytes) =
+    TE.decodeUtf8 (BL.toStrict (BB.toLazyByteString (BB.byteStringHex keyBytes)))
 
-instance ToJSON Ref where toJSON (Ref t) = A.toJSON t
+instance ToJSON Ref where toJSON = A.toJSON . refText
 
--- Refs live inside proof trees (via OnDisk markers), so they need NFData and
--- Binary too. Binary goes via UTF-8 bytes since the binary package has no
--- Text instance.
-instance NFData Ref where rnf (Ref t) = rnf t
+instance NFData Ref where rnf (Ref keyBytes) = rnf keyBytes
+
+-- Refs use their raw 32 bytes in binary payloads.
 instance Bin.Binary Ref where
-  put (Ref t) = Bin.put (TE.encodeUtf8 t)
-  get = do
-    bytes <- Bin.get
-    pure (Ref (TE.decodeUtf8 bytes))
+  put (Ref keyBytes) = putByteString keyBytes
+  get = Ref <$> getByteString refByteCount
 
--- | What kind of thing a record holds, written as the "kind" tag so one log
--- can hold everything.
+refByteCount :: Int
+refByteCount = 32
+
+-- | Record type. The kind is also included in the key hash.
 data Kind
   = KNode          -- ^ one element of '_sNodes' (a rule instance)
   | KGoal          -- ^ one key of '_sGoals'
@@ -92,6 +115,9 @@ data Kind
   | KSubtermStore  -- ^ the whole '_sSubtermStore'
   | KEqStore       -- ^ the whole '_sEqStore'
   | KShell         -- ^ a spilled system (heavy fields as refs)
+  | KMethodEdge    -- ^ applied method + case refs, keyed by parent system
+  | KLemmaRoot     -- ^ lemma name -> root system, keyed by the name
+  | KLemmaMetadata -- ^ export metadata keyed by the lemma name
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 kindTag :: Kind -> T.Text
@@ -103,49 +129,57 @@ kindTag KFormulas     = "formulas"
 kindTag KSubtermStore = "subtermStore"
 kindTag KEqStore      = "eqStore"
 kindTag KShell        = "shell"
+kindTag KMethodEdge   = "methodEdge"
+kindTag KLemmaRoot    = "lemmaRoot"
+kindTag KLemmaMetadata = "lemmaMetadata"
 
--- | The open log plus its dedup/index state. The MVar guards both: whoever
--- holds it can append or seek-and-read, so parallel search sparks can't
--- interleave writes or double-claim a ref.
-data StoreCtx = StoreCtx
-  { scFileHandle :: Handle  -- ^ one ReadWriteMode handle for both roles:
-                            --   appends seek to the append offset, reads
-                            --   ('readRecord') seek to a ref's offset
-  , scState      :: MVar StoreState
+-- | Hash bytes in a kind-specific namespace.
+keyOf :: Kind -> BL.ByteString -> Ref
+keyOf kind bytes =
+    Ref (BA.convert (hashlazy (Bin.encode (kindTag kind) <> bytes) :: Digest SHA256))
+
+-- | Compute the content-addressed key used for a stored value.
+valueRef :: Bin.Binary a => Kind -> a -> Ref
+valueRef kind = keyOf kind . Bin.encode
+
+-- | Offset and size of a complete record, including its header.
+data RecordLocation = RecordLocation
+  { recordOffset :: !Word64
+  , recordSize   :: !Word64
   }
 
--- | One record's location in the log: byte offset and full framed length.
-data Position = Position
-  { posOffset :: !Word64
-  , posLength :: !Word64
+-- | Parsed record header, shared by recovery and JSON export.
+data RecordHeader = RecordHeader
+  { headerKind          :: !Kind
+  , headerKey           :: !Ref
+  , headerPayloadLength :: !Word64
   }
 
--- | Every written ref with its record's position -- the dedup set and the
--- random-access index in one -- plus the append offset.
-data StoreState = StoreState
-  { ssPositions      :: M.Map Ref Position
-  , ssAppendOffset   :: !Word64
-  , ssAtAppendOffset :: !Bool  -- ^ file handle already at the append offset?
-                               --   Appends only seek after a read moved the
-                               --   handle ('hSeek' flushes the write buffer,
-                               --   so a seek per append would defeat
-                               --   buffering entirely)
+-- | The MVar serializes writes and owns the append offset. Readers access
+-- the immutable index snapshot and use positional reads.
+data Store = Store
+  { storeFd           :: !Fd
+  , storeAppendOffset :: !(MVar Word64)
+  , storeIndex        :: !(IORef (M.Map Ref RecordLocation))
   }
 
--- | Where the log lives on disk. Binary's the only format we store (we hash
--- the binary encoding anyway) -- use 'dumpStoreJSON' if you want JSON.
+-- | Path to the binary log.
 storePath :: FilePath -> FilePath
 storePath dir = dir </> "store.bin"
 
--- | The process-global store. Nothing until 'initStore' runs. Has to be
--- global since the prover is pure and there's no seam to pass a handle
--- through.
+-- | Identifies the binary layout before any records are read.
+storeVersionHeader :: BS.ByteString
+storeVersionHeader = "tamarin-store-v2\n"
+
+storeVersionHeaderSize :: Word64
+storeVersionHeaderSize = fromIntegral (BS.length storeVersionHeader)
+
+-- | Process-global store, initialized by the CLI.
 {-# NOINLINE globalStore #-}
-globalStore :: IORef (Maybe StoreCtx)
+globalStore :: IORef (Maybe Store)
 globalStore = unsafePerformIO (newIORef Nothing)
 
--- | Open the log under DIR and set up the global store. Call this once from
--- the CLI layer when eviction is turned on.
+-- | Open the log, rebuild the index, and truncate a torn tail.
 initStore :: FilePath -> IO ()
 initStore dir = do
     existing <- readIORef globalStore
@@ -153,83 +187,246 @@ initStore dir = do
       Just _  -> error "initStore: store already initialized"
       Nothing -> do
         createDirectoryIfMissing True dir
-        h <- openFile (storePath dir) ReadWriteMode
-        hSetBuffering h (BlockBuffering Nothing)
-        end <- fromIntegral <$> hFileSize h
-        hSeek h AbsoluteSeek (fromIntegral end)
-        state <- newMVar (StoreState M.empty end True)
-        writeIORef globalStore (Just (StoreCtx h state))
+        fileHandle <- openFile (storePath dir) ReadWriteMode
+        gotLock <- hTryLock fileHandle ExclusiveLock
+        unless gotLock $ do
+          hClose fileHandle
+          ioError (userError ("initStore: " ++ storePath dir
+                              ++ " is in use by another tamarin process"))
+        originalFileEnd <- fromIntegral <$> hFileSize fileHandle
+        fileEnd <- if originalFileEnd == 0
+          then do
+            BS.hPut fileHandle storeVersionHeader
+            hFlush fileHandle
+            pure storeVersionHeaderSize
+          else do
+            validateStoreHeader fileHandle originalFileEnd
+            pure originalFileEnd
+        (index, validEnd) <- scanIndex fileHandle fileEnd
 
--- | Close the log and drop the global. Fine to call even if the store was
--- never opened.
+        -- Remove bytes left by an incomplete / unrecoverable record
+        when (validEnd < fileEnd) $ hSetFileSize fileHandle (fromIntegral validEnd)
+        fd <- handleToFd fileHandle   -- consumes the Handle; the fd keeps the lock
+        appendOffsetVar <- newMVar validEnd
+        indexRef        <- newIORef index
+        writeIORef globalStore (Just (Store fd appendOffsetVar indexRef))
+
+-- | Reject stores written with another binary layout without modifying them.
+validateStoreHeader :: Handle -> Word64 -> IO ()
+validateStoreHeader fileHandle fileSize = do
+    hSeek fileHandle AbsoluteSeek 0
+    actualHeader <- BS.hGet fileHandle (BS.length storeVersionHeader)
+    unless (fileSize >= storeVersionHeaderSize
+            && actualHeader == storeVersionHeader) $ do
+      hClose fileHandle
+      ioError (userError ("initStore: incompatible store.bin; expected "
+                          ++ show storeVersionHeader))
+
+-- | Rebuild the index from record headers. Stop at the first incomplete
+-- record and return the end of the valid prefix.
+scanIndex :: Handle -> Word64 -> IO (M.Map Ref RecordLocation, Word64)
+scanIndex fileHandle fileSize = scanFromOffset storeVersionHeaderSize M.empty
+  where
+    -- Walk complete records from left to right. The offset returned here is
+    -- where the next append should start.
+    scanFromOffset :: Word64
+                   -> M.Map Ref RecordLocation
+                   -> IO (M.Map Ref RecordLocation, Word64)
+    scanFromOffset currentOffset indexSoFar
+      | currentOffset + recordHeaderSize64 > fileSize =
+          pure (indexSoFar, currentOffset)
+      | otherwise = do
+          hSeek fileHandle AbsoluteSeek (fromIntegral currentOffset)
+          headerBytes <- BS.hGet fileHandle recordHeaderSize
+          case decodeRecordHeader headerBytes of
+            Nothing ->
+              pure (indexSoFar, currentOffset)
+            Just header -> do
+              let payloadLength = header.headerPayloadLength
+                  payloadBytesAvailable =
+                    fileSize - currentOffset - recordHeaderSize64
+              if payloadLength > payloadBytesAvailable
+                then pure (indexSoFar, currentOffset)
+                else do
+                  let completeRecordSize = recordHeaderSize64 + payloadLength
+                      nextOffset = currentOffset + completeRecordSize
+                      location = RecordLocation currentOffset completeRecordSize
+                      updatedIndex =
+                        M.insert header.headerKey location indexSoFar
+                  scanFromOffset nextOffset updatedIndex
+
+-- | Close the store. Only call this after all store operations finished.
 closeStore :: IO ()
 closeStore = do
     existing <- readIORef globalStore
     case existing of
-      Nothing  -> pure ()
-      Just ctx -> do
-        hClose (scFileHandle ctx)
+      Nothing    -> pure ()
+      Just store -> do
         writeIORef globalStore Nothing
+        closeFd store.storeFd
 
--- | Hash a value into its Ref: SHA-256 of the kind tag plus its binary
--- encoding. We mix in the kind because Binary doesn't tag types -- two
--- different types with the same shape (say Edge vs LessAtom) could otherwise
--- hash identically and alias each other's records.
-refOfBytes :: Kind -> BL.ByteString -> Ref
-refOfBytes kind bytes = Ref (T.pack (show digest))
-  where
-    digest = hashlazy (Bin.encode (kindTag kind) <> bytes) :: Digest SHA256
-
--- | Store a value and get back its Ref. Only appends a record the first time
--- we see this content -- duplicates just cost one hash, no I/O. The binary
--- encoding is computed once and shared by the hash and the on-disk payload.
-writeOnce :: Bin.Binary a => Kind -> a -> IO Ref
-writeOnce kind x = do
-    let payload = Bin.encode x
-        ref     = refOfBytes kind payload
-    -- force ref (the hash) all the way before we touch the lock below --
-    -- otherwise something forced inside the locked section could chase a
-    -- lazy thunk into readSystemLive and deadlock on this same MVar
-    _ <- evaluate ref
+-- | Get the open store.
+requireStore :: IO Store
+requireStore = do
     existing <- readIORef globalStore
     case existing of
-      Nothing  -> error "writeOnce: store not initialized (did you pass --evict?)"
-      Just ctx -> modifyMVar (scState ctx) (claim ctx payload ref)
-  where
-    claim ctx payload ref st =
-      if M.member ref (ssPositions st)
-        then pure (st, ref)
-        else do
-          let framed   = encodeRecord kind ref payload
-              len      = fromIntegral (BL.length framed)
-              newState = st { ssPositions      = M.insert ref (Position (ssAppendOffset st) len) (ssPositions st)
-                            , ssAppendOffset   = ssAppendOffset st + len
-                            , ssAtAppendOffset = True
-                            }
-          unless (ssAtAppendOffset st) $
-            hSeek (scFileHandle ctx) AbsoluteSeek (fromIntegral (ssAppendOffset st))
-          BL.hPut (scFileHandle ctx) framed
-          pure (newState, ref)
+      Nothing    -> error "store not initialized (did you pass --evict?)"
+      Just store -> pure store
 
--- | Read one record's payload back by its Ref. Runs under the store lock
+-- | Store a value once, keyed by its content hash.
+writeOnce :: Bin.Binary a => Kind -> a -> IO Ref
+writeOnce kind value = do
+    let payload = Bin.encode value
+        ref     = keyOf kind payload
+
+    -- Force the hash before taking the writer lock.
+    _ <- evaluate ref
+
+    store <- requireStore
+    modifyMVarMasked store.storeAppendOffset $ \appendOffset -> do
+      index <- readIORef store.storeIndex
+      -- Check again under the lock in case another thread wrote it first.
+      if M.member ref index
+        then pure (appendOffset, ref)
+        else do
+          location <- appendRecord store index appendOffset kind ref payload
+          pure (appendOffset + location.recordSize, ref)
+
+-- | Store a subject-addressed record. Repeating the same payload is a no-op;
+-- a different payload for the same key is an error.
+writeKeyed :: Bin.Binary a => String -> Kind -> Ref -> a -> IO ()
+writeKeyed caller kind key value = do
+    let payload = Bin.encode value
+
+    -- Force computations before we take the lock
+    _ <- evaluate key
+    _ <- evaluate (BL.length payload)
+    store <- requireStore
+
+    -- Lock: storeAppendOffset
+    modifyMVarMasked store.storeAppendOffset $ \appendOffset -> do
+      index <- readIORef store.storeIndex
+      case M.lookup key index of
+        Nothing -> do
+          location <- appendRecord store index appendOffset kind key payload
+          pure (appendOffset + location.recordSize, ())
+        Just existingLocation -> do
+          existingPayload <- readRecordPayloadAt store existingLocation
+          if existingPayload == payload
+            then pure (appendOffset, ())
+            else error (caller ++ ": conflicting record for key " ++ show key
+                        ++ " -- one store belongs to one proof invocation;"
+                        ++ " was it reused with a different heuristic or theory?")
+
+-- | Append one record and publish it after the complete write.
+appendRecord :: Store
+             -> M.Map Ref RecordLocation
+             -> Word64
+             -> Kind
+             -> Ref
+             -> BL.ByteString
+             -> IO RecordLocation
+appendRecord store index appendOffset kind key payload = do
+    let framedRecord = encodeRecord kind key payload
+        location     = RecordLocation appendOffset
+                                       (fromIntegral (BL.length framedRecord))
+    writeToFile store.storeFd (fromIntegral appendOffset) framedRecord
+    atomicWriteIORef store.storeIndex $! M.insert key location index
+    pure location
+
+-- | Encode one @[kind][key][length][payload]@ record.
+encodeRecord :: Kind -> Ref -> BL.ByteString -> BL.ByteString
+encodeRecord kind (Ref keyBytes) payload = BL.concat
+    [ BL.singleton (fromIntegral (fromEnum kind))
+    , BL.fromStrict keyBytes
+    , Bin.encode (fromIntegral (BL.length payload) :: Word64)
+    , payload
+    ]
+
+-- Fixed header layout.
+kindByteCount, payloadLengthByteCount, recordHeaderSize :: Int
+kindByteCount          = 1
+payloadLengthByteCount = 8
+recordHeaderSize       = kindByteCount + refByteCount + payloadLengthByteCount
+
+recordHeaderSize64 :: Word64
+recordHeaderSize64 = fromIntegral recordHeaderSize
+
+keyFieldOffset, payloadLengthFieldOffset :: Int
+keyFieldOffset           = kindByteCount
+payloadLengthFieldOffset = kindByteCount + refByteCount
+
+-- | Decode the fixed-width header.
+decodeRecordHeader :: BS.ByteString -> Maybe RecordHeader
+decodeRecordHeader bytes
+  | BS.length bytes /= recordHeaderSize = Nothing
+  | kindNumber > fromEnum (maxBound :: Kind) = Nothing
+  | otherwise = Just RecordHeader
+      { headerKind          = toEnum kindNumber
+      , headerKey           = Ref keyBytes
+      , headerPayloadLength = payloadLength
+      }
+  where
+    kindNumber = fromIntegral (BS.head bytes)
+    keyBytes = BS.take refByteCount (BS.drop keyFieldOffset bytes)
+    payloadLength = Bin.decode
+                  $ BL.fromStrict
+                  $ BS.drop payloadLengthFieldOffset bytes
+
+-- | Write the complete lazy ByteString, retrying any short writes.
+writeToFile :: Fd -> FileOffset -> BL.ByteString -> IO ()
+writeToFile fd initialOffset bytes =
+    writeChunks initialOffset (BL.toChunks bytes)
+  where
+    writeChunks :: FileOffset -> [BS.ByteString] -> IO ()
+    writeChunks _ [] = pure ()
+    writeChunks offset (currentChunk : laterChunks)
+      | BS.null currentChunk = writeChunks offset laterChunks
+      | otherwise = do
+          bytesWritten <- fdPwrite fd currentChunk offset
+          when (bytesWritten == 0) $
+            error "writeToFile: write made no progress (disk full?)"
+          let writtenByteCount = fromIntegral bytesWritten
+              nextOffset = offset + fromIntegral bytesWritten
+              unwrittenPart = BS.drop writtenByteCount currentChunk
+              remainingChunks
+                | BS.null unwrittenPart = laterChunks
+                | otherwise = unwrittenPart : laterChunks
+          writeChunks nextOffset remainingChunks
+
+-- | Read exactly the requested byte range.
+readFileAt :: Fd -> FileOffset -> ByteCount -> IO BS.ByteString
+readFileAt fd initialOffset requestedBytes =
+    BS.concat . reverse <$> readRemaining initialOffset requestedBytes []
+  where
+    readRemaining _ 0 chunksReversed = pure chunksReversed
+    readRemaining offset bytesRemaining chunksReversed = do
+      chunk <- fdPread fd bytesRemaining offset
+      when (BS.null chunk) $
+        error "readFileAt: unexpected end of file (index/store mismatch)"
+      let bytesRead = BS.length chunk
+      readRemaining (offset + fromIntegral bytesRead)
+                    (bytesRemaining - fromIntegral bytesRead)
+                    (chunk : chunksReversed)
+
+-- | Read a record and remove its header.
+readRecordPayloadAt :: Store -> RecordLocation -> IO BL.ByteString
+readRecordPayloadAt store location = do
+    recordBytes <- readFileAt store.storeFd
+                                 (fromIntegral location.recordOffset)
+                                 (fromIntegral location.recordSize)
+    pure (BL.fromStrict (BS.drop recordHeaderSize recordBytes))
+
+-- | Read a record payload by key.
 readRecord :: Ref -> IO BL.ByteString
 readRecord ref = do
-    _ <- evaluate ref
-    existing <- readIORef globalStore
-    case existing of
-      Nothing  -> error "readRecord: store not initialized"
-      Just ctx -> modifyMVar (scState ctx) (fetch ctx)
-  where
-    fetch ctx st =
-      case M.lookup ref (ssPositions st) of
-        Nothing  -> error ("readRecord: no record for ref " ++ T.unpack (refText ref))
-        Just pos -> do
-          hSeek (scFileHandle ctx) AbsoluteSeek (fromIntegral (posOffset pos))
-          bytes <- BS.hGet (scFileHandle ctx) (fromIntegral (posLength pos))
-          let newState = st { ssAtAppendOffset = False }
-          pure (newState, BL.drop recordHeaderLen (BL.fromStrict bytes))
+    store <- requireStore
+    index <- readIORef store.storeIndex
+    case M.lookup ref index of
+      Nothing       -> error ("readRecord: no record for ref " ++ show ref)
+      Just location -> readRecordPayloadAt store location
 
--- | Same as 'readSystemLive', but Nothing if no store is open 
+-- | Read a system if the store is open.
 readSystemLiveMaybe :: Ref -> IO (Maybe System)
 readSystemLiveMaybe ref = do
     existing <- readIORef globalStore
@@ -237,75 +434,55 @@ readSystemLiveMaybe ref = do
       Nothing -> pure Nothing
       Just _  -> Just <$> readSystemLive ref
 
--- | Rebuild a System from its shell Ref, reading each field back from the
--- log. 
+-- | Rebuild a System from its shell and referenced fields.
 readSystemLive :: Ref -> IO System
 readSystemLive shellRef = do
-    sh       <- deref shellRef
-    nodes    <- traverse deref (shNodes sh)
-    goals    <- mapM derefGoal (shGoals sh)
-    edges    <- mapM deref (shEdges sh)
-    lessAts  <- mapM deref (shLessAtoms sh)
-    subterms <- deref (shSubtermStore sh)
-    eqStore  <- deref (shEqStore sh)
-    formulas <- deref (shFormulas sh)
-    solved   <- deref (shSolvedFormulas sh)
-    lemmas   <- deref (shLemmas sh)
+    shell    <- deref shellRef :: IO SystemShell
+    nodes    <- traverse deref shell.shNodes
+    goals    <- mapM derefGoal shell.shGoals
+    edges    <- mapM deref shell.shEdges
+    lessAts  <- mapM deref shell.shLessAtoms
+    subterms <- deref shell.shSubtermStore
+    eqStore  <- deref shell.shEqStore
+    formulas <- deref shell.shFormulas
+    solved   <- deref shell.shSolvedFormulas
+    lemmas   <- deref shell.shLemmas
     pure System
       { _sNodes          = nodes
       , _sEdges          = S.fromList edges
       , _sLessAtoms      = S.fromList lessAts
-      , _sLastAtom       = shLastAtom sh
+      , _sLastAtom       = shell.shLastAtom
       , _sSubtermStore   = subterms
       , _sEqStore        = eqStore
       , _sFormulas       = formulas
       , _sSolvedFormulas = solved
       , _sLemmas         = lemmas
       , _sGoals          = M.fromList goals
-      , _sNextGoalNr     = shNextGoalNr sh
-      , _sSourceKind     = shSourceKind sh
-      , _sDiffSystem     = shDiffSystem sh
+      , _sNextGoalNr     = shell.shNextGoalNr
+      , _sSourceKind     = shell.shSourceKind
+      , _sDiffSystem     = shell.shDiffSystem
       }
   where
     deref :: Bin.Binary a => Ref -> IO a
     deref ref = do
         payload <- readRecord ref
-        case decodePayload ref payload of
-          Left err -> error ("readSystemLive: " ++ err)
-          Right x  -> pure x
+        decodePayload ref payload
 
-    derefGoal (r, status) = do
-        g <- deref r
-        pure (g, status)
+    derefGoal (goalRef, status) = do
+        goal <- deref goalRef
+        pure (goal, status)
 
--- | Bytes before the payload in a binary record: kind (1) + ref (64) + len (8).
-recordHeaderLen :: Num a => a
-recordHeaderLen = 73
+-- | Decode a stored payload or report which ref was invalid.
+decodePayload :: Bin.Binary a => Ref -> BL.ByteString -> IO a
+decodePayload ref payload = case Bin.decodeOrFail payload of
+    Left (_, _, decodeError) ->
+      error ("binary decode of " ++ show ref ++ ": " ++ decodeError)
+    Right (_, _, value) ->
+      pure value
 
--- | One binary record: @[kind : 1B][ref : 64B hex][len : 8B BE][payload]@.
-encodeRecord :: Kind -> Ref -> BL.ByteString -> BL.ByteString
-encodeRecord kind ref payload = BL.concat
-    [ BL.singleton (fromIntegral (fromEnum kind))
-    , BL.fromStrict (TE.encodeUtf8 (refText ref))
-    , Bin.encode (fromIntegral (BL.length payload) :: Word64)
-    , payload
-    ]
+-- storing systems
 
--- storing a whole System (write side of the spill)
-
--- | Strip the display-only fields (ruleColor, ruleProcess) before hashing, so
--- rules that only differ in how they're displayed still dedup. Matches the
--- JSON instance, which drops the same two fields.
-canonicalizeRule :: RuleACInst -> RuleACInst
-canonicalizeRule rule = L.modify rInfo dropDisplay rule
-  where
-    dropDisplay (ProtoInfo info) = ProtoInfo (L.modify praciAttributes noDisplay info)
-    dropDisplay (IntrInfo info)  = IntrInfo info
-    noDisplay attrs = attrs { ruleColor = Nothing, ruleProcess = Nothing }
-
--- | A System with the heavy fields swapped for refs and the small scalars
--- kept inline -- this is what a spilled system looks like on disk. Same type
--- for Binary and JSON (instances below), so read and write can't drift apart.
+-- | A System with its larger fields replaced by refs.
 data SystemShell = SystemShell
   { shNodes          :: M.Map NodeId Ref
   , shEdges          :: [Ref]
@@ -325,124 +502,248 @@ data SystemShell = SystemShell
 
 instance Bin.Binary SystemShell
 
--- JSON keys mirror the 'System' field names, so JSONL shells read naturally.
+-- Keep JSON keys aligned with System fields.
 instance ToJSON SystemShell where
-  toJSON sh = object
-    [ "_sNodes"          .= shNodes sh
-    , "_sEdges"          .= shEdges sh
-    , "_sLessAtoms"      .= shLessAtoms sh
-    , "_sLastAtom"       .= shLastAtom sh
-    , "_sSubtermStore"   .= shSubtermStore sh
-    , "_sEqStore"        .= shEqStore sh
-    , "_sFormulas"       .= shFormulas sh
-    , "_sSolvedFormulas" .= shSolvedFormulas sh
-    , "_sLemmas"         .= shLemmas sh
-    , "_sGoals"          .= shGoals sh
-    , "_sNextGoalNr"     .= shNextGoalNr sh
-    , "_sSourceKind"     .= shSourceKind sh
-    , "_sDiffSystem"     .= shDiffSystem sh
+  toJSON shell = object
+    [ "_sNodes"          .= shell.shNodes
+    , "_sEdges"          .= shell.shEdges
+    , "_sLessAtoms"      .= shell.shLessAtoms
+    , "_sLastAtom"       .= shell.shLastAtom
+    , "_sSubtermStore"   .= shell.shSubtermStore
+    , "_sEqStore"        .= shell.shEqStore
+    , "_sFormulas"       .= shell.shFormulas
+    , "_sSolvedFormulas" .= shell.shSolvedFormulas
+    , "_sLemmas"         .= shell.shLemmas
+    , "_sGoals"          .= shell.shGoals
+    , "_sNextGoalNr"     .= shell.shNextGoalNr
+    , "_sSourceKind"     .= shell.shSourceKind
+    , "_sDiffSystem"     .= shell.shDiffSystem
     ]
 
--- | Store a System and return the Ref of its shell. The shell's own ref is a
--- hash of its encoding, and its parts are all refs too, so it's Merkle-ish.
+-- | Store a System and return its shell ref.
 storeSystem :: System -> IO Ref
-storeSystem sys = do
-    nodeRefs    <- traverse (writeOnce KNode) (_sNodes canonSys)
-    goalRefs    <- mapM storeGoal (M.toList (_sGoals canonSys))
-    edgeRefs    <- mapM (writeOnce KEdge)     (S.toList (_sEdges canonSys))
-    lessRefs    <- mapM (writeOnce KLessAtom) (S.toList (_sLessAtoms canonSys))
-    formulasRef <- writeOnce KFormulas     (_sFormulas canonSys)
-    solvedRef   <- writeOnce KFormulas     (_sSolvedFormulas canonSys)
-    lemmasRef   <- writeOnce KFormulas     (_sLemmas canonSys)
-    subtermRef  <- writeOnce KSubtermStore (_sSubtermStore canonSys)
-    eqRef       <- writeOnce KEqStore      (_sEqStore canonSys)
+storeSystem system = do
+    nodeRefs    <- traverse (writeOnce KNode) system._sNodes
+    goalRefs    <- mapM storeGoal (M.toList system._sGoals)
+    edgeRefs    <- mapM (writeOnce KEdge)     (S.toList system._sEdges)
+    lessRefs    <- mapM (writeOnce KLessAtom) (S.toList system._sLessAtoms)
+    formulasRef <- writeOnce KFormulas     system._sFormulas
+    solvedRef   <- writeOnce KFormulas     system._sSolvedFormulas
+    lemmasRef   <- writeOnce KFormulas     system._sLemmas
+    subtermRef  <- writeOnce KSubtermStore system._sSubtermStore
+    eqRef       <- writeOnce KEqStore      system._sEqStore
     let shell = SystemShell
           { shNodes          = nodeRefs
           , shEdges          = edgeRefs
           , shLessAtoms      = lessRefs
-          , shLastAtom       = _sLastAtom canonSys
+          , shLastAtom       = system._sLastAtom
           , shSubtermStore   = subtermRef
           , shEqStore        = eqRef
           , shFormulas       = formulasRef
           , shSolvedFormulas = solvedRef
           , shLemmas         = lemmasRef
           , shGoals          = goalRefs
-          , shNextGoalNr     = _sNextGoalNr canonSys
-          , shSourceKind     = _sSourceKind canonSys
-          , shDiffSystem     = _sDiffSystem canonSys
+          , shNextGoalNr     = system._sNextGoalNr
+          , shSourceKind     = system._sSourceKind
+          , shDiffSystem     = system._sDiffSystem
           }
     writeOnce KShell shell
   where
-    canonSys = sys { _sNodes = M.map canonicalizeRule (_sNodes sys) }
     storeGoal (goal, status) = do
         goalRef <- writeOnce KGoal goal
         pure (goalRef, status)
 
--- reading the log back (read side of the spill)
+-- method edges
 
--- | A loaded log: kind + raw payload per Ref. We only decode a payload once
--- something actually asks for it, so loading itself stays cheap.
-newtype StoreTables = StoreTables (M.Map Ref (Kind, BL.ByteString))
+-- | The selected method and all child cases for one system.
+data MethodEdge = MethodEdge
+  { meSubject  :: Ref                      -- ^ the parent system
+  , meMethod   :: ProofMethod
+  , meChildren :: M.Map CaseName Ref
+  } deriving (Generic)
 
--- | Read store.bin back into StoreTables by splitting it into records. A torn
--- tail (process got killed mid-write) just gets dropped with a warning;
--- corruption anywhere else is a hard error locating the record.
-loadStore :: FilePath -> IO StoreTables
-loadStore dir = do
-    bytes   <- BL.readFile (storePath dir)
-    records <- collect (0 :: Int) bytes
-    pure (StoreTables (M.fromList records))
+instance Bin.Binary MethodEdge
+
+instance ToJSON MethodEdge where
+  toJSON edge = object [ "subject"  .= edge.meSubject
+                       , "method"   .= show edge.meMethod
+                       , "children" .= edge.meChildren ]
+
+-- | Derive the lookup key for a system's method edge.
+edgeKey :: Ref -> Ref
+edgeKey (Ref parentBytes) = keyOf KMethodEdge (BL.fromStrict parentBytes)
+
+-- | Store the method applied at a system.
+storeProofStep :: Ref -> ProofMethod -> M.Map CaseName Ref -> IO ()
+storeProofStep parent method children =
+    writeKeyed "storeProofStep" KMethodEdge (edgeKey parent)
+               (MethodEdge parent method children)
+
+-- | Read the stored proof step, if present.
+readProofStepMaybe :: Ref -> IO (Maybe MethodEdge)
+readProofStepMaybe parent = readKeyedMaybe (edgeKey parent)
+
+-- lemma roots
+
+-- | A lemma name and its root system.
+data LemmaRoot = LemmaRoot
+  { lrLemma :: String
+  , lrRoot  :: Ref
+  } deriving (Generic)
+
+instance Bin.Binary LemmaRoot
+
+instance ToJSON LemmaRoot where
+  toJSON root = object [ "lemma" .= root.lrLemma, "root" .= root.lrRoot ]
+
+-- | Additional lemma information used for standalone exports and restore
+-- validation.
+data LemmaMetadata = LemmaMetadata
+  { lmLemma              :: String
+  , lmTraceQuantifier    :: SystemTraceQuantifier
+  , lmContextFingerprint :: Ref
+  } deriving (Generic)
+
+instance Bin.Binary LemmaMetadata
+
+instance ToJSON LemmaMetadata where
+  toJSON metadata = object
+    [ "lemma" .= metadata.lmLemma
+    , "traceQuantifier" .= show metadata.lmTraceQuantifier
+    , "contextFingerprint" .= metadata.lmContextFingerprint
+    ]
+
+-- | Derive the lookup key for a lemma root.
+rootKey :: String -> Ref
+rootKey lemmaName = keyOf KLemmaRoot (Bin.encode lemmaName)
+
+-- | Derive the lookup key for a lemma's export metadata.
+metadataKey :: String -> Ref
+metadataKey lemmaName = keyOf KLemmaMetadata (Bin.encode lemmaName)
+
+-- | Record a lemma's root system and standalone-export metadata.
+recordLemmaRoot :: String -> SystemTraceQuantifier -> Ref -> Ref -> IO ()
+recordLemmaRoot lemmaName traceQuantifier root contextFingerprint = do
+    writeKeyed "recordLemmaRoot" KLemmaRoot (rootKey lemmaName)
+               (LemmaRoot lemmaName root)
+    writeKeyed "recordLemmaMetadata" KLemmaMetadata (metadataKey lemmaName)
+               (LemmaMetadata lemmaName traceQuantifier contextFingerprint)
+
+-- | Read a lemma root, if present.
+readLemmaRootMaybe :: String -> IO (Maybe Ref)
+readLemmaRootMaybe lemmaName =
+    fmap lrRoot <$> readKeyedMaybe (rootKey lemmaName)
+
+-- | Read a subject-addressed record, if present.
+readKeyedMaybe :: Bin.Binary a => Ref -> IO (Maybe a)
+readKeyedMaybe key = do
+    existing <- readIORef globalStore
+    case existing of
+      Nothing    -> pure Nothing
+      Just store -> do
+        index <- readIORef store.storeIndex
+        case M.lookup key index of
+          Nothing       -> pure Nothing
+          Just location -> do
+            payload <- readRecordPayloadAt store location
+            value <- decodePayload key payload
+            pure (Just value)
+
+-- Store snapshots and JSON dump
+
+-- | One complete record from an immutable prefix of store.bin.
+data StoredRecord = StoredRecord
+  { storedKind    :: Kind
+  , storedKey     :: Ref
+  , storedPayload :: BL.ByteString
+  }
+
+-- | Read the complete-record prefix of store.bin once. A torn tail is ignored.
+readStoreRecords :: FilePath -> IO [StoredRecord]
+readStoreRecords dir = do
+    bytes <- BL.readFile (storePath dir)
+    recordBytes <- removeStoreHeader bytes
+    let records = collectStoreRecords recordBytes
+    _ <- evaluate (length records)
+    pure records
+
+-- | Check and remove the version header for standalone readers.
+removeStoreHeader :: BL.ByteString -> IO BL.ByteString
+removeStoreHeader bytes
+  | BL.take headerSize bytes == expectedHeader =
+      pure (BL.drop headerSize bytes)
+  | otherwise =
+      ioError (userError ("incompatible store.bin; expected "
+                          ++ show storeVersionHeader))
   where
-    collect _ rest | BL.null rest = pure []
-    collect n rest
-      | BL.length header < recordHeaderLen || BL.length payload < fromIntegral len = do
-          putStrLn ("loadStore: dropping torn final record (record " ++ show n ++ ")")
-          pure []
-      | otherwise = do
-          restRecords <- collect (n + 1) rest'
-          pure ((ref, (kind, payload)) : restRecords)
-      where
-        (header, body)    = BL.splitAt recordHeaderLen rest
-        (kindB, afterK)   = BL.splitAt 1 header
-        (refB, lenB)      = BL.splitAt 64 afterK
-        len               = Bin.decode lenB :: Word64
-        (payload, rest')  = BL.splitAt (fromIntegral len) body
-        ref               = Ref (TE.decodeUtf8 (BL.toStrict refB))
-        kindByte          = fromIntegral (BL.head kindB)
-        kind = if kindByte <= fromEnum (maxBound :: Kind)
-                 then toEnum kindByte
-                 else error ("loadStore: unknown kind byte " ++ show kindByte
-                             ++ " at record " ++ show n)
+    headerSize = fromIntegral storeVersionHeaderSize
+    expectedHeader = BL.fromStrict storeVersionHeader
 
--- | Decode a payload to a concrete type.
-decodePayload :: Bin.Binary a => Ref -> BL.ByteString -> Either String a
-decodePayload ref b = case Bin.decodeOrFail b of
-    Right (_, _, x)  -> Right x
-    Left (_, _, err) -> Left ("binary decode of " ++ T.unpack (refText ref)
-                              ++ ": " ++ err)
+-- | Decode a stored payload and reject trailing bytes.
+decodeStoredRecord :: Bin.Binary a => StoredRecord -> Either String a
+decodeStoredRecord record =
+    case Bin.decodeOrFail record.storedPayload of
+      Left (_, _, decodeError) -> Left decodeError
+      Right (remaining, _, value)
+        | BL.null remaining -> Right value
+        | otherwise         -> Left "binary payload has trailing bytes"
 
--- | Write a readable DIR/store.jsonl next to DIR/store.bin, one
--- {"kind","id","content"} line per record. Works any time, even on a crashed
--- run's store. Returns the path.
-dumpStoreJSON :: FilePath -> IO FilePath
-dumpStoreJSON dir = do
-    StoreTables table <- loadStore dir
+-- | Write store.jsonl from an already captured store snapshot.
+writeStoreJSON :: FilePath -> [StoredRecord] -> IO FilePath
+writeStoreJSON dir records = do
     let out = dir </> "store.jsonl"
-    BL.writeFile out (BL.concat (map jsonLine (M.toList table)))
+    BL.writeFile out (BL.concat (map jsonLine records))
     pure out
   where
-    jsonLine (ref, (kind, payload)) =
-        A.encode (object [ "kind"    .= kindTag kind
-                         , "id"      .= ref
-                         , "content" .= content kind payload ]) <> "\n"
-    content kind p = case kind of
-      KNode         -> A.toJSON (dec p :: RuleACInst)
-      KGoal         -> A.toJSON (dec p :: Goal)
-      KEdge         -> A.toJSON (dec p :: Edge)
-      KLessAtom     -> A.toJSON (dec p :: LessAtom)
-      KFormulas     -> A.toJSON (dec p :: S.Set LNGuarded)
-      KSubtermStore -> A.toJSON (dec p :: SubtermStore)
-      KEqStore      -> A.toJSON (dec p :: EqStore)
-      KShell        -> A.toJSON (dec p :: SystemShell)
-    dec :: Bin.Binary a => BL.ByteString -> a
-    dec p = Bin.decode p
+    jsonLine record =
+        A.encode (object [ "kind"    .= kindTag record.storedKind
+                         , "id"      .= record.storedKey
+                         , "content" .= content record ]) <> "\n"
+
+    content record = case record.storedKind of
+      KNode          -> decodeJSON record (undefined :: RuleACInst)
+      KGoal          -> decodeJSON record (undefined :: Goal)
+      KEdge          -> decodeJSON record (undefined :: Edge)
+      KLessAtom      -> decodeJSON record (undefined :: LessAtom)
+      KFormulas      -> decodeJSON record (undefined :: S.Set LNGuarded)
+      KSubtermStore  -> decodeJSON record (undefined :: SubtermStore)
+      KEqStore       -> decodeJSON record (undefined :: EqStore)
+      KShell         -> decodeJSON record (undefined :: SystemShell)
+      KMethodEdge    -> decodeJSON record (undefined :: MethodEdge)
+      KLemmaRoot     -> decodeJSON record (undefined :: LemmaRoot)
+      KLemmaMetadata -> decodeJSON record (undefined :: LemmaMetadata)
+
+    decodeJSON :: (Bin.Binary a, ToJSON a) => StoredRecord -> a -> A.Value
+    decodeJSON record expectedType =
+        A.toJSON (decodedValue `asTypeOf` expectedType)
+      where
+        decodedValue = either (error . recordDecodeError record) id
+                              (decodeStoredRecord record)
+
+-- | Write store.jsonl next to store.bin.
+dumpStoreJSON :: FilePath -> IO FilePath
+dumpStoreJSON dir = readStoreRecords dir >>= writeStoreJSON dir
+
+-- | Parse every complete record and stop before an invalid or torn tail.
+collectStoreRecords :: BL.ByteString -> [StoredRecord]
+collectStoreRecords remaining
+  | BL.length headerBytes < fromIntegral recordHeaderSize = []
+  | otherwise =
+      case decodeRecordHeader (BL.toStrict headerBytes) of
+        Nothing -> []
+        Just header ->
+          let payloadLength = header.headerPayloadLength
+              (payload, afterRecord) =
+                BL.splitAt (fromIntegral payloadLength) body
+          in if BL.length payload < fromIntegral payloadLength
+               then []
+               else StoredRecord header.headerKind header.headerKey payload
+                    : collectStoreRecords afterRecord
+  where
+    (headerBytes, body) = BL.splitAt (fromIntegral recordHeaderSize) remaining
+
+-- | Add record identity to an export decoding error.
+recordDecodeError :: StoredRecord -> String -> String
+recordDecodeError record decodeError =
+    "binary decode of " ++ show record.storedKey ++ " ("
+    ++ show record.storedKind ++ "): " ++ decodeError

@@ -60,7 +60,6 @@ module Web.Handler
   )
 where
 
-import Theory.Constraint.Solver.TreeExport (writeLemmaTrees)
 import Theory
   ( Theory(..), DiffTheory(..), ClosedTheory, ClosedDiffTheory, Side
   , ClosedTheory, ClosedDiffTheory, Side, Signature(..)
@@ -317,8 +316,6 @@ replaceTheory parent origin thy rep idx = do
               TheoryInfo idx thy time parentIdx False (fromJust newOrigin)
                       (maybe yesod.defaultAutoProver (.autoProver) parent) rep)
       storeTheory yesod newThy idx
-      -- write tree files after every step so external tools can read them
-      mapM_ (\dir -> writeLemmaTrees dir thy) yesod.thyOpts.evictDir
       pure (M.insert idx newThy theories, idx)
 
 -- | Replace a diff theory at the given index (backward compatibility wrapper).
@@ -361,8 +358,6 @@ putTheory parent origin thy rep = do
             TheoryInfo idx thy time parentIdx False (fromJust newOrigin)
                     (maybe yesod.defaultAutoProver (.autoProver) parent) rep)
     storeTheory yesod newThy idx
-    -- write tree files after every step so external tools can read them
-    mapM_ (\dir -> writeLemmaTrees dir thy) yesod.thyOpts.evictDir
     pure (M.insert idx newThy theories, idx)
 
 -- | Store a theory, return index.

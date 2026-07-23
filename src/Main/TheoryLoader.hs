@@ -88,7 +88,7 @@ theoryLoadFlags =
       ["evict"]
       (updateArg "evict")
       "DIR"
-      "store each expanded proof step's system in DIR/store.bin and drop it from memory, keeps peak memory down (see --json-store to view it as JSON)",
+      "store each expanded proof step's system in DIR/store.bin and drop it from memory, keeps peak memory down (see --evict-json to export JSON)",
     flagOpt
       ""
       ["prove"]

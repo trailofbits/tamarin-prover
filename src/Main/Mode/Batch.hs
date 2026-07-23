@@ -28,8 +28,8 @@ import Theory hiding (closeTheory)
 import Theory.Module
 import Theory.Tools.Wellformedness (prettyWfErrorReport)
 
-import Theory.Constraint.Solver.Store (initStore, closeStore, dumpStoreJSON)
-import Theory.Constraint.Solver.TreeExport (writeLemmaTrees)
+import Theory.Constraint.Solver.Store (initStore, closeStore)
+import Theory.Constraint.Solver.TreeExport (writeStoreExports)
 import Main.Console
 import Main.Environment
 import Main.TheoryLoader
@@ -67,8 +67,8 @@ batchMode = tamarinMode
               , flagNone ["precompute-only"] (addEmptyArg "precomputeOnly")
                   "Just run precomputation and show partial deconstructions"
 
-              , flagReq ["json-store"] (updateArg "jsonStore") "DIR"
-                  "write DIR/store.jsonl, a readable JSON view of DIR/store.bin (works even on a crashed run)"
+              , flagReq ["evict-json"] (updateArg "evictJSON") "DIR"
+                  "write DIR/store.jsonl and lemma tree JSON files from DIR/store.bin"
 
               ] ++
               outputFlags ++
@@ -92,9 +92,8 @@ batchMode = tamarinMode
 -- | Process a theory file.
 run :: TamarinMode -> Arguments -> IO ()
 run thisMode as
-  | Just dumpDir <- findArg "jsonStore" as :: Maybe FilePath, null inFiles = do
-      path <- dumpStoreJSON dumpDir
-      putStrLn ("wrote " ++ path)
+  | Just exportDir <- findArg "evictJSON" as :: Maybe FilePath, null inFiles =
+      writeEvictionJSON exportDir
   | null inFiles = helpAndExit thisMode (Just "no input files given")
   | argExists "parseOnly" as = do
       res <- mapM (processThy "") inFiles
@@ -143,10 +142,7 @@ run thisMode as
         putStrLn $ renderDoc $ ppSummary summary
 
       closeStore
-      mapM_ (\d -> do
-               path <- dumpStoreJSON d
-               putStrLn ("wrote " ++ path))
-            (findArg "jsonStore" as :: Maybe FilePath)
+      mapM_ writeEvictionJSON (findArg "evictJSON" as :: Maybe FilePath)
 
   where
     ppSummary summary = Pretty.vcat [ Pretty.text ""
@@ -156,6 +152,11 @@ run thisMode as
                                     , summary
                                     , Pretty.text ""
                                     , Pretty.text $ replicate 78 '=' ]
+
+    -- | Export every readable JSON artifact from one eviction store snapshot.
+    writeEvictionJSON :: FilePath -> IO ()
+    writeEvictionJSON dir =
+        writeStoreExports dir >>= mapM_ (putStrLn . ("wrote " ++))
 
     ppRep (inFile, outFile, time, summary) =
       Pretty.vcat
@@ -239,10 +240,6 @@ run thisMode as
       else do
         (report, thy') <- closeTheory versionData thyLoadOptions sig' thy
         _ <- liftIO $ bitraverse outputTraces (const $ return ()) thy'
-        liftIO $ mapM_ (\dir -> case thy' of
-                                  Left closedThy -> writeLemmaTrees dir closedThy
-                                  Right _        -> putStrLn "checkpoint: diff theories are not supported")
-                       thyLoadOptions.evictDir
 
         pure $
           either (\t -> (prettyClosedTheory t,     ppWf report Pretty.$--$ prettyClosedSummary t))
