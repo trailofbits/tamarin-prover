@@ -298,7 +298,7 @@ run thisMode as
             -- | Collect all solved (i.e. a trace was found) systems of the theory along with their
             -- path in the proof.
             proofSystems :: IncrementalProof -> [(ProofPath, System)]
-            proofSystems (LNode (ProofStep (Finished Solved) (Just ref)) _) | Just rootSystem <- viewSystem ref =  [([], rootSystem)]
+            proofSystems (LNode (ProofStep (Finished Solved) (Just ref)) _) | Just rootSystem <- getOrRestoreSystem ref =  [([], rootSystem)]
             proofSystems (LNode (ProofStep _ _) children) =  
               [(l : ls, system) | (l, subProof) <- M.toList children 
                                 , (ls, system) <- proofSystems subProof ]

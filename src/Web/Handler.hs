@@ -93,7 +93,7 @@ import Theory
   , toSignaturePure
   , checkAndExtendProver
   , theoryRestrictions
-  , Prover (runProver), unproven
+  , Prover (runProver), unproven,
   )
 
 import Theory.Proof
@@ -1012,7 +1012,7 @@ getTheoryPathMR idx path = do
     where
         go:: RenderUrl -> TheoryPath -> TheoryInfo -> HandlerFor WebUI Value
         go _ (TheoryMethod lemma proofPath i) ti = modifyTheory ti
-            (\thy -> pure $ applyMethodAtPath thy lemma proofPath ti.autoProver i)
+            (\thy -> evictSystemsFromLemma  lemma (applyMethodAtPath thy lemma proofPath ti.autoProver i))
             (\thy -> nextSmartThyPath thy (TheoryProof lemma proofPath))
             (JsonAlert "Sorry, but the prover failed on the selected method!")
 
@@ -1088,7 +1088,9 @@ getProverAllR (name, mkProver) idx = do
       where
         names thy = (._lName) <$> getLemmas thy
         autoProver = mkProver ti.autoProver
-        proveAll thy = pure $ foldM (\tha lemma -> applyProverAtPath tha lemma [] autoProver) thy $ names thy
+        proveAll thy = pure $
+          foldM (\tha lemma -> applyProverAtPath tha lemma [] autoProver)
+                thy (names thy)
 
 -- | Run the some prover on a given proof path.
 getProverDiffR

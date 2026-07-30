@@ -34,6 +34,8 @@ module Web.Theory
   , applyDiffProverAtPath
   , applyProverAtPathDiff
   , dotGraphString
+  , evictSystemsFromLemma
+  , restoreLemmaProofs
   )
 where
 
@@ -68,14 +70,110 @@ import Logic.Connectives
 import Theory hiding (lPlaintext)
 import Theory.Text.Pretty
 import ClosedTheory (prettyClosedProtoRule)
-import TheoryObject (theoryMacros, prettyTactic, diffTheoryMacros, diffTheorySideRules, DiffLemma (..))
+import TheoryObject (theoryMacros, prettyTactic, diffTheoryMacros, diffTheorySideRules, DiffLemma (..), toSystemTraceQuantifier)
 
+import System.IO (hPutStrLn, stderr)
 import Web.Settings
 import Web.Types
+
+import Theory.Constraint.Solver.Store (Ref, isStoreOpen, readLemmaRootMaybe, recordLemmaRoot, storeSystem, valueRef, Kind (KTheoryContext), setTheoryContext)
+import Rule (crcRules, crcRawSources, crcRefinedSources, crcInjectiveFactInsts)
 
 ------------------------------------------------------------------------------
 -- Various other functions
 ------------------------------------------------------------------------------
+
+-- | Fingerprint of everything a stored proof step's validity depends on: the
+-- rules it was proved against, the equational theory, and the precomputed
+-- sources. Excludes the heuristic and tactic (they pick which valid step to
+-- take, not which steps are valid) and the Maude binary's path, so a store
+-- stays portable between machines.
+theoryContextFingerPrint :: ClosedTheory -> Ref
+theoryContextFingerPrint theory =
+  valueRef KTheoryContext
+    ( "theory-context-v1" :: String
+    , L.get crcRules              ruleCache
+    , L.get crcRawSources         ruleCache
+    , L.get crcRefinedSources     ruleCache
+    , L.get crcInjectiveFactInsts ruleCache
+    , toSignaturePure (L.get thySignature theory)
+    )
+  where
+    -- Nested gets rather than composed lenses: this module uses Prelude's
+    -- (.), while fclabels lens composition needs Control.Category's.
+    ruleCache = L.get thyCache theory
+
+-- | Evict the systems stored in the selected lemma proof.
+evictSystemsFromLemma :: String -> Maybe ClosedTheory -> IO (Maybe ClosedTheory)
+evictSystemsFromLemma _ Nothing = pure Nothing
+evictSystemsFromLemma lemmaName (Just theory) = do
+    -- If store is open we evict
+    storeOpen <- isStoreOpen
+
+    if storeOpen
+      then do
+        evictedItems <- mapM evictItem theory._thyItems
+        pure $ Just (theory { _thyItems = evictedItems })
+      else
+        pure (Just theory)
+  where
+    evictItem (LemmaItem lemma)
+      | lemma._lName == lemmaName = do
+          evictedProof <- evictSystemsFromIncrementalProof lemma._lProof
+          pure $ LemmaItem (lemma { _lProof = evictedProof })
+    evictItem item = pure item
+
+
+-- | Restore each lemma's proof from the store when its root system matches,
+-- and otherwise record the current root so a later run can restore it.
+restoreLemmaProofs :: ClosedTheory -> IO ClosedTheory
+restoreLemmaProofs theory = do
+    -- Perform checks that the theory did not change and then restore lemma
+    storeOpen <- isStoreOpen
+    hPutStrLn stderr ("DBG restoreLemmaProofs: called, storeOpen=" ++ show storeOpen
+              ++ " nItems=" ++ show (length theory._thyItems))
+    if not storeOpen
+      then pure theory
+      else do
+        sameTheoryContext <- setTheoryContext (theoryContextFingerPrint theory)
+        if not sameTheoryContext
+          then do
+            putStrLn "evecition store was build against a different theory and we wont restore"
+            pure theory
+          else do
+            restoredItems <- mapM restoreItem theory._thyItems
+            pure theory { _thyItems = restoredItems }
+  where
+    restoreItem (LemmaItem lemma) = LemmaItem <$> restoreLemma lemma
+    restoreItem item              = pure item
+
+    restoreLemma lemma =
+        case psInfo (root lemma._lProof) >>= getSystemIfInMemory of
+          Nothing            -> do
+            hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root system NOT in memory")
+            pure lemma
+          Just initialSystem -> do
+            currentRootRef <- storeSystem initialSystem
+            storedRootRef  <- readLemmaRootMaybe lemma._lName
+            if storedRootRef /= Just currentRootRef
+              then do
+                recordLemmaRoot lemma._lName
+                                (toSystemTraceQuantifier lemma._lTraceQuantifier)
+                                currentRootRef
+                hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root MISMATCH stored="
+                          ++ show storedRootRef ++ " current=" ++ show currentRootRef)
+                pure lemma
+              else do
+                restored <- restoreProofFromStore currentRootRef
+                case restored of
+                  Nothing    -> do
+                    hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root matched but NO EDGE at "
+                              ++ show currentRootRef)
+                    pure lemma
+                  Just proof -> do
+                    hPutStrLn stderr ("restored proof for lemma " ++ lemma._lName)
+                    pure lemma { _lProof = proof }
+
 
 applyMethodAtPath :: ClosedTheory -> String -> ProofPath
                   -> AutoProver            -- ^ How to extract/order the proof methods.
@@ -85,7 +183,7 @@ applyMethodAtPath thy lemmaName proofPath prover i = do
     lemma <- lookupLemma lemmaName thy
     subProof <- lemma._lProof `atPath` proofPath
     let ctxt  = getProofContext lemma thy
-        sys   = psInfo (root subProof) >>= memSystem
+        sys   = getOrRestoreProofSystem subProof
         heuristic = selectHeuristic prover ctxt
         ranking = useHeuristic heuristic (length proofPath)
         tactic = selectTactic prover ctxt
@@ -101,7 +199,7 @@ applyMethodAtPathDiff thy s lemmaName proofPath prover i = do
     lemma <- lookupLemmaDiff s lemmaName thy
     subProof <- lemma._lProof `atPath` proofPath
     let ctxt  = getProofContextDiff s lemma thy
-        sys   = psInfo (root subProof) >>= memSystem
+        sys   = psInfo (root subProof) >>= getSystemIfInMemory
         heuristic = selectHeuristic prover ctxt
         ranking = useHeuristic heuristic (length proofPath)
         tactic = selectTactic prover ctxt
@@ -521,7 +619,7 @@ subProofSnippet :: HtmlDocument d
                 -> IncrementalProof          -- ^ The sub-proof.
                 -> d
 subProofSnippet renderUrl renderImgUrl tidx ti lemma proofPath ctxt prf =
-    case psInfo (root prf) >>= memSystem of
+    case getOrRestoreProofSystem prf of
       Nothing -> text $ "no annotated constraint system / " ++ nCases ++ " sub-case(s)"
       Just se -> vcat $
         prettyApplicableProofMethods se
@@ -623,7 +721,7 @@ subProofDiffSnippet :: HtmlDocument d
                     -> IncrementalProof          -- ^ The sub-proof.
                     -> d
 subProofDiffSnippet renderUrl tidx ti s lemma proofPath ctxt prf =
-    case psInfo (root prf) >>= memSystem of
+    case psInfo (root prf) >>= getSystemIfInMemory of
       Nothing -> text $ "no annotated constraint system / " ++ nCases ++ " sub-case(s)"
       Just se -> vcat $
         prettyApplicableProofMethods se
@@ -1332,7 +1430,7 @@ imgThyPath imageFormat outputCommand cacheDir_ toDot toJSON thy thyPath =
     proofPathSystem lemma proofPath = do
       let jsonLabel = "Theory: " ++ thy._thyName ++ " Lemma: " ++ lemma
       subProof <- resolveProofPath thy lemma proofPath
-      sequent <- psInfo (root subProof) >>= memSystem
+      sequent <- getOrRestoreProofSystem subProof
       return (jsonLabel, sequent)
 
     -- | Prefix dot code with comment mentioning all protocol rule names
@@ -1452,7 +1550,7 @@ imgDiffThyPath imgFormat dotCommand cacheDir_ compact thy path mirror = case pat
     proofPathDotCode s lemma proofPath =
       D.showDot "G" $ fromMaybe (return ()) $ do
         subProof <- resolveProofPathDiff thy s lemma proofPath
-        sequent <- psInfo (root subProof) >>= memSystem
+        sequent <- psInfo (root subProof) >>= getSystemIfInMemory
         return $ compact sequent
 
     -- Get dot code for proof path in lemma
@@ -1561,7 +1659,7 @@ interactiveDotDiffThyPath compact thy path mirror = go path
     proofPathDotCode s lemma proofPath =
       D.showDot "G" $ fromMaybe (return ()) $ do
         subProof <- resolveProofPathDiff thy s lemma proofPath
-        sequent <- psInfo (root subProof) >>= memSystem
+        sequent <- psInfo (root subProof) >>= getSystemIfInMemory
         return $ compact sequent
 
     -- Get dot code for proof path in lemma
@@ -2239,5 +2337,5 @@ dotGraphString toDot thy thyPath = do
     proofPathSystem lemma proofPath = do
       let jsonLabel = "Theory: " ++ thy._thyName ++ " Lemma: " ++ lemma
       subProof <- resolveProofPath thy lemma proofPath
-      sequent <- psInfo (root subProof) >>= memSystem
+      sequent <- getOrRestoreProofSystem subProof
       return (jsonLabel, sequent)

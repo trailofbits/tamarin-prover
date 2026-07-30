@@ -46,6 +46,7 @@ import Theory
 import Theory.Tools.Wellformedness
 import Text.PrettyPrint.Class qualified as Pretty
 import Text.PrettyPrint.Html
+import Web.Theory (restoreLemmaProofs)
 
 -- | Create YesodDispatch instance for the interface.
 -- mkYesodDispatch "WebUIDiff" resourcesWebUI
@@ -185,8 +186,10 @@ loadTheories thOpts readyMsg thDir thLoad thClose autoProver = do
                      <> "\n" <> (renderHtmlDoc . htmlDoc $ prettyWfErrorReport report)
                      <> "\n</div>"
           unless (null report) $ putStrLn $ renderDoc $ ppInteractive report path
+          -- Try to restore the lemma from disk
+          thy' <- either (fmap Left . restoreLemmaProofs) (pure . Right) thy
           let theoryInfo t = TheoryInfo idx t time Nothing True (Local path) autoProver wfErrors
-          pure $ Just (idx, either (Trace . theoryInfo) (Diff . theoryInfo) thy)
+          pure $ Just (idx, either (Trace . theoryInfo) (Diff . theoryInfo) thy')
       where
         reportFailure err inFile = Pretty.vcat $ Pretty.text <$>
           [ replicate 78 '-'

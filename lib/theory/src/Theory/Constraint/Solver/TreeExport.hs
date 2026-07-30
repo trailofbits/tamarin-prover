@@ -40,8 +40,10 @@ writeLemmaTrees :: FilePath -> [StoredRecord] -> IO [FilePath]
 writeLemmaTrees storeDirectory storedRecords = mapM writeLemmaTree lemmaRoots
   where
     lemmaRoots :: [LemmaRoot]
-    lemmaRoots = sortOn (\root -> root.lrLemma)
-                        (decodeRecords KLemmaRoot storedRecords)
+    lemmaRoots = sortOn (\root -> root.lrLemma) $ Map.elems $ Map.fromList
+      [ (lemmaRoot.lrLemma, lemmaRoot)
+      | lemmaRoot <- decodeRecords KLemmaRoot storedRecords
+      ]
 
     methodEdgesBySystem :: Map.Map Ref MethodEdge
     methodEdgesBySystem = Map.fromList

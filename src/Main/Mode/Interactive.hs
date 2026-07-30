@@ -120,8 +120,7 @@ run thisMode as = case findArg "workDir" as of
         (closeTheory version thyLoadOptions)
 
         (argExists "debug" as) (readOutputCommand as) readImageFormat
-        -- interactive mode never evicts, so autoprove and manual steps behave the same
-        (constructAutoProver thyLoadOptions) { apEvict = False }
+        (constructAutoProver thyLoadOptions)
         (runWarp port)
 
     else

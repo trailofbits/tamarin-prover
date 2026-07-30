@@ -24,6 +24,7 @@ module Theory.Constraint.Solver.Store
   , Kind(..)
   , initStore
   , closeStore
+  , isStoreOpen
   , writeOnce
   , storeSystem
   , readSystemLive
@@ -41,6 +42,7 @@ module Theory.Constraint.Solver.Store
   , LemmaMetadata(..)
   , recordLemmaRoot
   , readLemmaRootMaybe
+  , setTheoryContext
   ) where
 
 import           Theory.Constraint.System
@@ -118,6 +120,7 @@ data Kind
   | KMethodEdge    -- ^ applied method + case refs, keyed by parent system
   | KLemmaRoot     -- ^ lemma name -> root system, keyed by the name
   | KLemmaMetadata -- ^ export metadata keyed by the lemma name
+  | KTheoryContext  -- ^ the theory context every tree in this store was build against
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 kindTag :: Kind -> T.Text
@@ -132,6 +135,21 @@ kindTag KShell        = "shell"
 kindTag KMethodEdge   = "methodEdge"
 kindTag KLemmaRoot    = "lemmaRoot"
 kindTag KLemmaMetadata = "lemmaMetadata"
+kindTag KTheoryContext = "theoryContext"
+
+theoryContextKey :: Ref
+theoryContextKey = keyOf KTheoryContext (Bin.encode ("theory-context" :: String))
+
+setTheoryContext:: Ref -> IO Bool
+setTheoryContext fingerprint = do
+  existing <- readKeyedMaybe theoryContextKey
+  case existing of
+    -- Check if the provided theory context matches the existing one
+    Just storedFingerprint -> pure (storedFingerprint == fingerprint)
+    Nothing                -> do
+      -- No existing theory context
+      writeKeyed KTheoryContext theoryContextKey fingerprint
+      pure True
 
 -- | Hash bytes in a kind-specific namespace.
 keyOf :: Kind -> BL.ByteString -> Ref
@@ -169,7 +187,7 @@ storePath dir = dir </> "store.bin"
 
 -- | Identifies the binary layout before any records are read.
 storeVersionHeader :: BS.ByteString
-storeVersionHeader = "tamarin-store-v2\n"
+storeVersionHeader = "tamarin-store-v3\n"
 
 storeVersionHeaderSize :: Word64
 storeVersionHeaderSize = fromIntegral (BS.length storeVersionHeader)
@@ -265,6 +283,14 @@ closeStore = do
         writeIORef globalStore Nothing
         closeFd store.storeFd
 
+-- | Check whether this process has initialized a store.
+isStoreOpen :: IO Bool
+isStoreOpen = do
+    existing <- readIORef globalStore
+    pure $ case existing of
+      Nothing -> False
+      Just _  -> True
+
 -- | Get the open store.
 requireStore :: IO Store
 requireStore = do
@@ -292,10 +318,9 @@ writeOnce kind value = do
           location <- appendRecord store index appendOffset kind ref payload
           pure (appendOffset + location.recordSize, ref)
 
--- | Store a subject-addressed record. Repeating the same payload is a no-op;
--- a different payload for the same key is an error.
-writeKeyed :: Bin.Binary a => String -> Kind -> Ref -> a -> IO ()
-writeKeyed caller kind key value = do
+-- | Store a subject-addressed record
+writeKeyed :: Bin.Binary a => Kind -> Ref -> a -> IO ()
+writeKeyed kind key value = do
     let payload = Bin.encode value
 
     -- Force computations before we take the lock
@@ -306,17 +331,8 @@ writeKeyed caller kind key value = do
     -- Lock: storeAppendOffset
     modifyMVarMasked store.storeAppendOffset $ \appendOffset -> do
       index <- readIORef store.storeIndex
-      case M.lookup key index of
-        Nothing -> do
-          location <- appendRecord store index appendOffset kind key payload
-          pure (appendOffset + location.recordSize, ())
-        Just existingLocation -> do
-          existingPayload <- readRecordPayloadAt store existingLocation
-          if existingPayload == payload
-            then pure (appendOffset, ())
-            else error (caller ++ ": conflicting record for key " ++ show key
-                        ++ " -- one store belongs to one proof invocation;"
-                        ++ " was it reused with a different heuristic or theory?")
+      location <- appendRecord store index appendOffset kind key payload
+      pure (appendOffset + location.recordSize, ())
 
 -- | Append one record and publish it after the complete write.
 appendRecord :: Store
@@ -576,8 +592,7 @@ edgeKey (Ref parentBytes) = keyOf KMethodEdge (BL.fromStrict parentBytes)
 -- | Store the method applied at a system.
 storeProofStep :: Ref -> ProofMethod -> M.Map CaseName Ref -> IO ()
 storeProofStep parent method children =
-    writeKeyed "storeProofStep" KMethodEdge (edgeKey parent)
-               (MethodEdge parent method children)
+    writeKeyed KMethodEdge (edgeKey parent) (MethodEdge parent method children)
 
 -- | Read the stored proof step, if present.
 readProofStepMaybe :: Ref -> IO (Maybe MethodEdge)
@@ -601,7 +616,6 @@ instance ToJSON LemmaRoot where
 data LemmaMetadata = LemmaMetadata
   { lmLemma              :: String
   , lmTraceQuantifier    :: SystemTraceQuantifier
-  , lmContextFingerprint :: Ref
   } deriving (Generic)
 
 instance Bin.Binary LemmaMetadata
@@ -610,7 +624,6 @@ instance ToJSON LemmaMetadata where
   toJSON metadata = object
     [ "lemma" .= metadata.lmLemma
     , "traceQuantifier" .= show metadata.lmTraceQuantifier
-    , "contextFingerprint" .= metadata.lmContextFingerprint
     ]
 
 -- | Derive the lookup key for a lemma root.
@@ -622,12 +635,11 @@ metadataKey :: String -> Ref
 metadataKey lemmaName = keyOf KLemmaMetadata (Bin.encode lemmaName)
 
 -- | Record a lemma's root system and standalone-export metadata.
-recordLemmaRoot :: String -> SystemTraceQuantifier -> Ref -> Ref -> IO ()
-recordLemmaRoot lemmaName traceQuantifier root contextFingerprint = do
-    writeKeyed "recordLemmaRoot" KLemmaRoot (rootKey lemmaName)
-               (LemmaRoot lemmaName root)
-    writeKeyed "recordLemmaMetadata" KLemmaMetadata (metadataKey lemmaName)
-               (LemmaMetadata lemmaName traceQuantifier contextFingerprint)
+recordLemmaRoot :: String -> SystemTraceQuantifier -> Ref -> IO ()
+recordLemmaRoot lemmaName traceQuantifier root = do
+    writeKeyed KLemmaRoot (rootKey lemmaName) (LemmaRoot lemmaName root)
+    writeKeyed KLemmaMetadata (metadataKey lemmaName)
+               (LemmaMetadata lemmaName traceQuantifier)
 
 -- | Read a lemma root, if present.
 readLemmaRootMaybe :: String -> IO (Maybe Ref)
@@ -712,6 +724,7 @@ writeStoreJSON dir records = do
       KMethodEdge    -> decodeJSON record (undefined :: MethodEdge)
       KLemmaRoot     -> decodeJSON record (undefined :: LemmaRoot)
       KLemmaMetadata -> decodeJSON record (undefined :: LemmaMetadata)
+      KTheoryContext -> decodeJSON record (undefined :: Ref)
 
     decodeJSON :: (Bin.Binary a, ToJSON a) => StoredRecord -> a -> A.Value
     decodeJSON record expectedType =

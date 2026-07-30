@@ -58,8 +58,11 @@ module Theory.Proof (
   , IncrementalProof
   , IncrementalDiffProof
   , SystemRef(..)
-  , memSystem
-  , viewSystem
+  , getSystemIfInMemory
+  , getOrRestoreSystem
+  , getOrRestoreProofSystem
+  , evictSystemsFromIncrementalProof
+  , restoreProofFromStore
   , Prover
   , DiffProver
   , runProver
@@ -125,12 +128,16 @@ import qualified Control.Monad.State              as S
 import           Control.Parallel.Strategies
 
 import           Theory.Constraint.Solver
-import           Theory.Constraint.Solver.Store   (Ref, Kind(KLemmaMetadata), MethodEdge(..), readProofStepMaybe,
+import           Theory.Constraint.Solver.Store   (Ref, MethodEdge(..), isStoreOpen,
+                                                    readLemmaRootMaybe,
+                                                    readProofStepMaybe,
                                                     readSystemLive,
-                                                    readSystemLiveMaybe, recordLemmaRoot,
-                                                    storeProofStep, storeSystem, valueRef)
+                                                    readSystemLiveMaybe,
+                                                    recordLemmaRoot,
+                                                    storeProofStep, storeSystem)
 import           Theory.Model
 import           Theory.Text.Pretty
+import qualified Data.Set as S
 
 
 
@@ -511,17 +518,84 @@ data SystemRef = InMem System | StoredInMem Ref System | OnDisk Ref
     deriving( Eq, Ord, Show, Generic, NFData, Binary )
 
 -- | Return a system that is still in memory.
-memSystem :: SystemRef -> Maybe System
-memSystem (InMem sys)           = Just sys
-memSystem (StoredInMem _ sys)   = Just sys
-memSystem (OnDisk _)            = Nothing
+getSystemIfInMemory :: SystemRef -> Maybe System
+getSystemIfInMemory (InMem sys)           = Just sys
+getSystemIfInMemory (StoredInMem _ sys)   = Just sys
+getSystemIfInMemory (OnDisk _)            = Nothing
 
 -- | Return a system, loading it from disk if necessary.
-viewSystem :: SystemRef -> Maybe System
-viewSystem (InMem sys)         = Just sys
-viewSystem (StoredInMem _ sys) = Just sys
-viewSystem (OnDisk r)          = unsafePerformIO (readSystemLiveMaybe r)
-{-# NOINLINE viewSystem #-}
+getOrRestoreSystem :: SystemRef -> Maybe System
+getOrRestoreSystem (InMem sys)         = Just sys
+getOrRestoreSystem (StoredInMem _ sys) = Just sys
+getOrRestoreSystem (OnDisk r)          = unsafePerformIO (readSystemLiveMaybe r)
+{-# NOINLINE getOrRestoreSystem #-}
+
+getOrRestoreProofSystem :: IncrementalProof -> Maybe System
+getOrRestoreProofSystem proof = psInfo (root proof) >>= getOrRestoreSystem
+
+
+
+-- | Store every system in an incremental proof and retain only its reference.
+evictSystemsFromIncrementalProof :: IncrementalProof -> IO IncrementalProof
+evictSystemsFromIncrementalProof proof = do
+    storeOpen <- isStoreOpen
+    unless storeOpen $
+        error "evictSystemsFromIncrementalProof: store is not initialized"
+    evictProof proof
+  where
+    evictProof (LNode (ProofStep method systemInfo) childProofs) = do
+        evictedSystemInfo <- mapM evictSystemRef systemInfo
+        evictedChildProofs <- mapM evictProof childProofs
+
+        storeMethodEdge method evictedSystemInfo evictedChildProofs
+
+        pure (LNode (ProofStep method evictedSystemInfo)
+                    evictedChildProofs)
+
+    evictSystemRef (InMem system)      = OnDisk <$> storeSystem system
+    evictSystemRef (StoredInMem ref _) = pure (OnDisk ref)
+    evictSystemRef (OnDisk ref)        = pure (OnDisk ref)
+
+    storeMethodEdge (Sorry _) _ _   = pure ()
+    storeMethodEdge Invalidated _ _ = pure ()
+    storeMethodEdge method (Just parentSystemRef) childProofs =
+        case traverse childRef childProofs of
+          Just childRefs -> storeProofStep (getStoredRef parentSystemRef) method childRefs
+          Nothing -> pure ()
+    storeMethodEdge _ _ _ =
+        pure ()
+
+    childRef childProof =
+        getStoredRef <$> psInfo (root childProof)
+
+
+-- | Rebuild a proof tree from the method edges recorded in the store.
+-- Nothing when the root has no recorded step, i.e. there is nothing to restore.
+restoreProofFromStore :: Ref -> IO (Maybe IncrementalProof)
+restoreProofFromStore rootRef = do
+    -- Try to get root node from Store first
+    rootStep <- readProofStepMaybe rootRef
+    case rootStep of
+      Nothing -> pure Nothing
+      Just _  -> Just <$> restoreNode S.empty rootRef
+  where
+    -- Restore
+    restoreNode ancestorRefs systemRef
+      | systemRef `S.member` ancestorRefs =
+          error ("restoreProofFromStore: cycle in stored method edges at "
+                 ++ show systemRef)
+      | otherwise = do
+          storedStep <- readProofStepMaybe systemRef
+          case storedStep of
+            -- A system that was stored but never expanded: the frontier where
+            -- the previous run stopped.
+            Nothing -> pure (LNode (ProofStep (Sorry (Just "not explored"))
+                                              (Just (OnDisk systemRef)))
+                                   M.empty)
+            Just (MethodEdge _ method caseRefs) -> do
+              childProofs <- traverse (restoreNode (S.insert systemRef ancestorRefs))
+                                      caseRefs
+              pure (LNode (ProofStep method (Just (OnDisk systemRef))) childProofs)
 
 -- | Incremental proofs are used to represent intermediate results of proof
 -- checking/construction.
@@ -631,8 +705,11 @@ focus path prover =
     Prover $ \ctxt d _ prf ->
         modifyAtPath (prover' ctxt (d + length path)) path prf
   where
+    -- Restore from the store if this node was evicted: with eviction on, every
+    -- node below the root is OnDisk, so demanding an in-memory system here
+    -- fails every proof step at depth >= 1.
     prover' ctxt d prf = do
-        se <- psInfo (root prf) >>= memSystem
+        se <- getOrRestoreProofSystem prf
         runProver prover ctxt d se prf
 
 -- | Apply a diff prover only to a sub-proof, fails if the subproof doesn't exist.
@@ -1073,8 +1150,7 @@ proveSystemDFSEvicted :: Heuristic ProofContext -> [Tactic ProofContext] -> Proo
 proveSystemDFSEvicted heuristic tactics ctxt depth0 initialSystem =
     prove depth0 (StoredInMem rootRef initialSystem)
   where
-    -- Store root system for easy reconstructing
-    rootRef = storeRoot heuristic tactics ctxt initialSystem
+    rootRef = storeInitialSystemUnsafe depth0 ctxt initialSystem
 
     prove !depth systemRef =
         let (parentRef, method, cases) = solveOrRestore heuristic tactics ctxt depth systemRef
@@ -1132,25 +1208,18 @@ loadSystemFromRef (InMem system)         = pure system
 loadSystemFromRef (StoredInMem _ system) = pure system
 loadSystemFromRef (OnDisk ref)           = readSystemLive ref
 
--- | Store a lemma root and the context needed to restore it safely.
-storeRoot :: Heuristic ProofContext -> [Tactic ProofContext] -> ProofContext
-          -> System -> Ref
-storeRoot heuristic tactics ctxt system = unsafePerformIO $ do
-    rootSysRef <- storeSystem system
-    let contextFingerprint = valueRef KLemmaMetadata
-                             ("proof-context-v1" :: String, rootSysRef,
-                              heuristic, tactics, normalizedContext)
-    recordLemmaRoot (L.get pcLemmaName ctxt)
-                    (L.get pcTraceQuantifier ctxt)
-                    rootSysRef
-                    contextFingerprint
-    pure rootSysRef
-  where
-    normalizedContext = ctxt { _pcHeuristic = Nothing
-                             , _pcTactic = Nothing
-                             , _pcVerbose = False
-                             }
-{-# NOINLINE storeRoot #-}
+storeInitialSystemUnsafe :: Int -> ProofContext -> System -> Ref
+storeInitialSystemUnsafe depth ctxt system = unsafePerformIO $ do
+    ref <- storeSystem system
+    when (depth == 0) $ do
+        let lemmaName = L.get pcLemmaName ctxt
+        storedRoot <- readLemmaRootMaybe lemmaName
+        when (storedRoot /= Just ref) $
+            recordLemmaRoot lemmaName
+                            (L.get pcTraceQuantifier ctxt)
+                            ref
+    pure ref
+{-# NOINLINE storeInitialSystemUnsafe #-}
 
 
 -- | @proveSystemDFS rules se@ explores all solutions of the initial
