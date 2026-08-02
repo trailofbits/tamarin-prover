@@ -93,7 +93,7 @@ import Theory
   , toSignaturePure
   , checkAndExtendProver
   , theoryRestrictions
-  , Prover (runProver), unproven,
+  , Prover (runProver), unproven
   )
 
 import Theory.Proof
@@ -1088,9 +1088,7 @@ getProverAllR (name, mkProver) idx = do
       where
         names thy = (._lName) <$> getLemmas thy
         autoProver = mkProver ti.autoProver
-        proveAll thy = pure $
-          foldM (\tha lemma -> applyProverAtPath tha lemma [] autoProver)
-                thy (names thy)
+        proveAll thy = pure $ foldM (\tha lemma -> applyProverAtPath tha lemma [] autoProver) thy $ names thy
 
 -- | Run the some prover on a given proof path.
 getProverDiffR

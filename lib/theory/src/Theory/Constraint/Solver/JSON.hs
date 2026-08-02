@@ -6,8 +6,8 @@
 
 -- |
 -- ToJSON instances for everything reachable from a System. This is the
--- rendering side of Theory.Constraint.Solver.Store.dumpStoreJSON -- the store
--- itself is binary, JSON is just a view we produce, never parsed back.
+-- rendering side of the proof-state store. The store itself is binary; JSON
+-- is only an exported view and is never parsed back.
 module Theory.Constraint.Solver.JSON () where
 
 import           Data.Aeson       (ToJSON(..), ToJSONKey, object, (.=))

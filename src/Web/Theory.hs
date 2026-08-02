@@ -130,15 +130,14 @@ restoreLemmaProofs :: ClosedTheory -> IO ClosedTheory
 restoreLemmaProofs theory = do
     -- Perform checks that the theory did not change and then restore lemma
     storeOpen <- isStoreOpen
-    hPutStrLn stderr ("DBG restoreLemmaProofs: called, storeOpen=" ++ show storeOpen
-              ++ " nItems=" ++ show (length theory._thyItems))
     if not storeOpen
       then pure theory
       else do
         sameTheoryContext <- setTheoryContext (theoryContextFingerPrint theory)
         if not sameTheoryContext
           then do
-            putStrLn "evecition store was build against a different theory and we wont restore"
+            hPutStrLn stderr
+              "eviction store was built against a different theory; proofs were not restored"
             pure theory
           else do
             restoredItems <- mapM restoreItem theory._thyItems
@@ -149,9 +148,7 @@ restoreLemmaProofs theory = do
 
     restoreLemma lemma =
         case psInfo (root lemma._lProof) >>= getSystemIfInMemory of
-          Nothing            -> do
-            hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root system NOT in memory")
-            pure lemma
+          Nothing            -> pure lemma
           Just initialSystem -> do
             currentRootRef <- storeSystem initialSystem
             storedRootRef  <- readLemmaRootMaybe lemma._lName
@@ -160,16 +157,11 @@ restoreLemmaProofs theory = do
                 recordLemmaRoot lemma._lName
                                 (toSystemTraceQuantifier lemma._lTraceQuantifier)
                                 currentRootRef
-                hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root MISMATCH stored="
-                          ++ show storedRootRef ++ " current=" ++ show currentRootRef)
                 pure lemma
               else do
                 restored <- restoreProofFromStore currentRootRef
                 case restored of
-                  Nothing    -> do
-                    hPutStrLn stderr ("DBG " ++ lemma._lName ++ ": root matched but NO EDGE at "
-                              ++ show currentRootRef)
-                    pure lemma
+                  Nothing    -> pure lemma
                   Just proof -> do
                     hPutStrLn stderr ("restored proof for lemma " ++ lemma._lName)
                     pure lemma { _lProof = proof }

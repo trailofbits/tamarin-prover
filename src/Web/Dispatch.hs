@@ -186,7 +186,7 @@ loadTheories thOpts readyMsg thDir thLoad thClose autoProver = do
                      <> "\n" <> (renderHtmlDoc . htmlDoc $ prettyWfErrorReport report)
                      <> "\n</div>"
           unless (null report) $ putStrLn $ renderDoc $ ppInteractive report path
-          -- Try to restore the lemma from disk
+          -- Try to restore stored lemma proofs.
           thy' <- either (fmap Left . restoreLemmaProofs) (pure . Right) thy
           let theoryInfo t = TheoryInfo idx t time Nothing True (Local path) autoProver wfErrors
           pure $ Just (idx, either (Trace . theoryInfo) (Diff . theoryInfo) thy')

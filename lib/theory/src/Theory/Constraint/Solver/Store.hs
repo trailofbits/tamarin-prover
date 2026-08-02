@@ -5,7 +5,7 @@
 -- |
 -- A content-addressed, append-only log for spilled proof state.
 --
---   > ["tamarin-store-v2\n"]
+--   > ["tamarin-store-v3\n"]
 --   > [kind : 1B][key : 32B][len : 8B BE][payload]
 --
 -- Values hash their payload. Method edges and lemma roots hash the subject
@@ -25,11 +25,9 @@ module Theory.Constraint.Solver.Store
   , initStore
   , closeStore
   , isStoreOpen
-  , writeOnce
   , storeSystem
   , readSystemLive
   , readSystemLiveMaybe
-  , dumpStoreJSON
   , StoredRecord(..)
   , readStoreRecords
   , writeStoreJSON
@@ -120,7 +118,7 @@ data Kind
   | KMethodEdge    -- ^ applied method + case refs, keyed by parent system
   | KLemmaRoot     -- ^ lemma name -> root system, keyed by the name
   | KLemmaMetadata -- ^ export metadata keyed by the lemma name
-  | KTheoryContext  -- ^ the theory context every tree in this store was build against
+  | KTheoryContext  -- ^ the theory context every tree in this store was built against
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 kindTag :: Kind -> T.Text
@@ -140,7 +138,7 @@ kindTag KTheoryContext = "theoryContext"
 theoryContextKey :: Ref
 theoryContextKey = keyOf KTheoryContext (Bin.encode ("theory-context" :: String))
 
-setTheoryContext:: Ref -> IO Bool
+setTheoryContext :: Ref -> IO Bool
 setTheoryContext fingerprint = do
   existing <- readKeyedMaybe theoryContextKey
   case existing of
@@ -732,10 +730,6 @@ writeStoreJSON dir records = do
       where
         decodedValue = either (error . recordDecodeError record) id
                               (decodeStoredRecord record)
-
--- | Write store.jsonl next to store.bin.
-dumpStoreJSON :: FilePath -> IO FilePath
-dumpStoreJSON dir = readStoreRecords dir >>= writeStoreJSON dir
 
 -- | Parse every complete record and stop before an invalid or torn tail.
 collectStoreRecords :: BL.ByteString -> [StoredRecord]

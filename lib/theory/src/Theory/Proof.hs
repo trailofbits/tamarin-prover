@@ -1184,19 +1184,13 @@ solveAndStore heuristic tactics ctxt depth parentRef systemRef = do
     system <- loadSystemFromRef systemRef
     let (method, cases) = nextProofStep heuristic tactics ctxt depth system
 
-    -- Fully evaluate/force the child systems before storing them
-    cases `deepseq` pure ()
-    -- Store each child so this proof step can refer to it (we need to store them anyways)
-    -- We dont evict them because we evaulate them later
+    -- Store each child as it is evaluated, retaining only its on-disk Ref.
     casesWithRefs <- mapM storeCase cases
 
     storeProofStep parentRef method (M.map getStoredRef casesWithRefs)
-    -- Keep each child in memory together with its stored Ref
     pure (parentRef, method, casesWithRefs)
   where
-    storeCase system = do
-        caseRef <- storeSystem system
-        pure (StoredInMem caseRef system)
+    storeCase system = OnDisk <$> storeSystem system
 
 getStoredRef :: SystemRef -> Ref
 getStoredRef (StoredInMem ref _) = ref

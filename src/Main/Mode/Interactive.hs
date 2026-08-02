@@ -30,7 +30,6 @@ import Main.Console
 import Main.Environment
 import Main.TheoryLoader
 import Theory.Constraint.Solver.Store (initStore)
-import Theory.Proof (AutoProver(..))
 
 
 ------------------------------------------------------------------------------
