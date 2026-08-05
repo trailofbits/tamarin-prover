@@ -5,7 +5,7 @@
 -- |
 -- A content-addressed, append-only log for spilled proof state.
 --
---   > ["tamarin-store-v3\n"]
+--   > ["tamarin-store-v4\n"]
 --   > [kind : 1B][key : 32B][len : 8B BE][payload]
 --
 -- Values hash their payload. Method edges and lemma roots hash the subject
@@ -37,7 +37,6 @@ module Theory.Constraint.Solver.Store
   , storeProofStep
   , readProofStepMaybe
   , LemmaRoot(..)
-  , LemmaMetadata(..)
   , recordLemmaRoot
   , readLemmaRootMaybe
   , setTheoryContext
@@ -116,8 +115,7 @@ data Kind
   | KEqStore       -- ^ the whole '_sEqStore'
   | KShell         -- ^ a spilled system (heavy fields as refs)
   | KMethodEdge    -- ^ applied method + case refs, keyed by parent system
-  | KLemmaRoot     -- ^ lemma name -> root system, keyed by the name
-  | KLemmaMetadata -- ^ export metadata keyed by the lemma name
+  | KLemmaRoot     -- ^ lemma name -> root system and metadata, keyed by the name
   | KTheoryContext  -- ^ the theory context every tree in this store was built against
   deriving (Eq, Ord, Show, Enum, Bounded)
 
@@ -132,7 +130,6 @@ kindTag KEqStore      = "eqStore"
 kindTag KShell        = "shell"
 kindTag KMethodEdge   = "methodEdge"
 kindTag KLemmaRoot    = "lemmaRoot"
-kindTag KLemmaMetadata = "lemmaMetadata"
 kindTag KTheoryContext = "theoryContext"
 
 theoryContextKey :: Ref
@@ -145,9 +142,17 @@ setTheoryContext fingerprint = do
     -- Check if the provided theory context matches the existing one
     Just storedFingerprint -> pure (storedFingerprint == fingerprint)
     Nothing                -> do
-      -- No existing theory context
-      writeKeyed KTheoryContext theoryContextKey fingerprint
-      pure True
+      -- Only a fresh store can safely adopt a context. Older batch stores may
+      -- contain unscoped method edges without a context record; accepting one
+      -- of those would allow stale proof steps to be replayed.
+      store <- requireStore
+      index <- readIORef store.storeIndex
+      if M.null index
+        then do
+          writeKeyed KTheoryContext theoryContextKey fingerprint
+          pure True
+        else
+          pure False
 
 -- | Hash bytes in a kind-specific namespace.
 keyOf :: Kind -> BL.ByteString -> Ref
@@ -185,7 +190,7 @@ storePath dir = dir </> "store.bin"
 
 -- | Identifies the binary layout before any records are read.
 storeVersionHeader :: BS.ByteString
-storeVersionHeader = "tamarin-store-v3\n"
+storeVersionHeader = "tamarin-store-v4\n"
 
 storeVersionHeaderSize :: Word64
 storeVersionHeaderSize = fromIntegral (BS.length storeVersionHeader)
@@ -600,44 +605,29 @@ readProofStepMaybe parent = readKeyedMaybe (edgeKey parent)
 
 -- | A lemma name and its root system.
 data LemmaRoot = LemmaRoot
-  { lrLemma :: String
-  , lrRoot  :: Ref
+  { lrLemma           :: String
+  , lrTraceQuantifier :: SystemTraceQuantifier
+  , lrRoot            :: Ref
   } deriving (Generic)
 
 instance Bin.Binary LemmaRoot
 
 instance ToJSON LemmaRoot where
-  toJSON root = object [ "lemma" .= root.lrLemma, "root" .= root.lrRoot ]
-
--- | Additional lemma information used for standalone exports and restore
--- validation.
-data LemmaMetadata = LemmaMetadata
-  { lmLemma              :: String
-  , lmTraceQuantifier    :: SystemTraceQuantifier
-  } deriving (Generic)
-
-instance Bin.Binary LemmaMetadata
-
-instance ToJSON LemmaMetadata where
-  toJSON metadata = object
-    [ "lemma" .= metadata.lmLemma
-    , "traceQuantifier" .= show metadata.lmTraceQuantifier
+  toJSON root = object
+    [ "lemma" .= root.lrLemma
+    , "traceQuantifier" .= show root.lrTraceQuantifier
+    , "root" .= root.lrRoot
     ]
 
 -- | Derive the lookup key for a lemma root.
 rootKey :: String -> Ref
 rootKey lemmaName = keyOf KLemmaRoot (Bin.encode lemmaName)
 
--- | Derive the lookup key for a lemma's export metadata.
-metadataKey :: String -> Ref
-metadataKey lemmaName = keyOf KLemmaMetadata (Bin.encode lemmaName)
-
--- | Record a lemma's root system and standalone-export metadata.
+-- | Record a lemma's root system and the metadata needed for tree export.
 recordLemmaRoot :: String -> SystemTraceQuantifier -> Ref -> IO ()
-recordLemmaRoot lemmaName traceQuantifier root = do
-    writeKeyed KLemmaRoot (rootKey lemmaName) (LemmaRoot lemmaName root)
-    writeKeyed KLemmaMetadata (metadataKey lemmaName)
-               (LemmaMetadata lemmaName traceQuantifier)
+recordLemmaRoot lemmaName traceQuantifier root =
+    writeKeyed KLemmaRoot (rootKey lemmaName)
+               (LemmaRoot lemmaName traceQuantifier root)
 
 -- | Read a lemma root, if present.
 readLemmaRootMaybe :: String -> IO (Maybe Ref)
@@ -721,7 +711,6 @@ writeStoreJSON dir records = do
       KShell         -> decodeJSON record (undefined :: SystemShell)
       KMethodEdge    -> decodeJSON record (undefined :: MethodEdge)
       KLemmaRoot     -> decodeJSON record (undefined :: LemmaRoot)
-      KLemmaMetadata -> decodeJSON record (undefined :: LemmaMetadata)
       KTheoryContext -> decodeJSON record (undefined :: Ref)
 
     decodeJSON :: (Bin.Binary a, ToJSON a) => StoredRecord -> a -> A.Value

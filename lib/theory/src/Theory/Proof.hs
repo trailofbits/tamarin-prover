@@ -556,7 +556,6 @@ evictSystemsFromIncrementalProof proof = do
     evictSystemRef (StoredInMem ref _) = pure (OnDisk ref)
     evictSystemRef (OnDisk ref)        = pure (OnDisk ref)
 
-    storeMethodEdge (Sorry _) _ _   = pure ()
     storeMethodEdge Invalidated _ _ = pure ()
     storeMethodEdge method (Just parentSystemRef) childProofs =
         case traverse childRef childProofs of
@@ -747,10 +746,10 @@ replaceSorryProver prover0 = Prover prover
   where
     prover ctxt d _ = return . replace
       where
-        replace prf@(LNode (ProofStep (Sorry _) (Just (InMem se))) _) =
-            fromMaybe prf $ runProver prover0 ctxt d se prf
-        replace prf@(LNode (ProofStep (Sorry _) (Just (StoredInMem _ se))) _) =
-            fromMaybe prf $ runProver prover0 ctxt d se prf
+        replace prf@(LNode (ProofStep (Sorry _) (Just systemRef)) _) =
+            fromMaybe prf $ do
+                system <- getOrRestoreSystem systemRef
+                runProver prover0 ctxt d system prf
         replace (LNode ps cases) =
             LNode ps $ M.map replace cases
 

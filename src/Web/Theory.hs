@@ -34,7 +34,7 @@ module Web.Theory
   , applyDiffProverAtPath
   , applyProverAtPathDiff
   , dotGraphString
-  , evictSystemsFromLemma
+  , evictSystemsFromLemmas
   , restoreLemmaProofs
   )
 where
@@ -76,37 +76,17 @@ import System.IO (hPutStrLn, stderr)
 import Web.Settings
 import Web.Types
 
-import Theory.Constraint.Solver.Store (Ref, isStoreOpen, readLemmaRootMaybe, recordLemmaRoot, storeSystem, valueRef, Kind (KTheoryContext), setTheoryContext)
-import Rule (crcRules, crcRawSources, crcRefinedSources, crcInjectiveFactInsts)
+import Theory.Constraint.Solver.Store (isStoreOpen, readLemmaRootMaybe, recordLemmaRoot, storeSystem)
 
 ------------------------------------------------------------------------------
 -- Various other functions
 ------------------------------------------------------------------------------
 
--- | Fingerprint of everything a stored proof step's validity depends on: the
--- rules it was proved against, the equational theory, and the precomputed
--- sources. Excludes the heuristic and tactic (they pick which valid step to
--- take, not which steps are valid) and the Maude binary's path, so a store
--- stays portable between machines.
-theoryContextFingerPrint :: ClosedTheory -> Ref
-theoryContextFingerPrint theory =
-  valueRef KTheoryContext
-    ( "theory-context-v1" :: String
-    , L.get crcRules              ruleCache
-    , L.get crcRawSources         ruleCache
-    , L.get crcRefinedSources     ruleCache
-    , L.get crcInjectiveFactInsts ruleCache
-    , toSignaturePure (L.get thySignature theory)
-    )
-  where
-    -- Nested gets rather than composed lenses: this module uses Prelude's
-    -- (.), while fclabels lens composition needs Control.Category's.
-    ruleCache = L.get thyCache theory
-
--- | Evict the systems stored in the selected lemma proof.
-evictSystemsFromLemma :: String -> Maybe ClosedTheory -> IO (Maybe ClosedTheory)
-evictSystemsFromLemma _ Nothing = pure Nothing
-evictSystemsFromLemma lemmaName (Just theory) = do
+-- | Evict the systems stored in matching lemma proofs. 'Nothing' selects all
+-- lemmas, which is used to persist the final trees returned by autoprove-all.
+evictSystemsFromLemmas :: Maybe String -> Maybe ClosedTheory -> IO (Maybe ClosedTheory)
+evictSystemsFromLemmas _ Nothing = pure Nothing
+evictSystemsFromLemmas selectedLemma (Just theory) = do
     -- If store is open we evict
     storeOpen <- isStoreOpen
 
@@ -118,7 +98,7 @@ evictSystemsFromLemma lemmaName (Just theory) = do
         pure (Just theory)
   where
     evictItem (LemmaItem lemma)
-      | lemma._lName == lemmaName = do
+      | maybe True (lemma._lName ==) selectedLemma = do
           evictedProof <- evictSystemsFromIncrementalProof lemma._lProof
           pure $ LemmaItem (lemma { _lProof = evictedProof })
     evictItem item = pure item
@@ -133,21 +113,14 @@ restoreLemmaProofs theory = do
     if not storeOpen
       then pure theory
       else do
-        sameTheoryContext <- setTheoryContext (theoryContextFingerPrint theory)
-        if not sameTheoryContext
-          then do
-            hPutStrLn stderr
-              "eviction store was built against a different theory; proofs were not restored"
-            pure theory
-          else do
-            restoredItems <- mapM restoreItem theory._thyItems
-            pure theory { _thyItems = restoredItems }
+        restoredItems <- mapM restoreItem theory._thyItems
+        pure theory { _thyItems = restoredItems }
   where
     restoreItem (LemmaItem lemma) = LemmaItem <$> restoreLemma lemma
     restoreItem item              = pure item
 
     restoreLemma lemma =
-        case psInfo (root lemma._lProof) >>= getSystemIfInMemory of
+        case getOrRestoreProofSystem lemma._lProof of
           Nothing            -> pure lemma
           Just initialSystem -> do
             currentRootRef <- storeSystem initialSystem

@@ -249,6 +249,7 @@ run thisMode as
         isTranslateOnlyMode = isJust thyLoadOptions.outputModule
 
         handleError e@(ParserError _) = die $ show e
+        handleError (StoreContextError message) = die message
         handleError (WarningError report) = do
           putStrLn $ renderDoc $ Pretty.vcat $ [ Pretty.text ""
                                                , Pretty.text "WARNING: the following wellformedness checks failed!" ]

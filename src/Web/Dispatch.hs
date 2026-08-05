@@ -41,7 +41,7 @@ import System.Directory
 import System.Exit
 import System.FilePath
 import Main.Console (renderDoc)
-import Main.TheoryLoader (TheoryLoadError(ParserError, WarningError), TheoryLoadOptions(..))
+import Main.TheoryLoader (TheoryLoadError(ParserError, StoreContextError, WarningError), TheoryLoadOptions(..))
 import Theory
 import Theory.Tools.Wellformedness
 import Text.PrettyPrint.Class qualified as Pretty
@@ -173,6 +173,9 @@ loadTheories thOpts readyMsg thDir thLoad thClose autoProver = do
       case result of
         Left (ParserError e) -> do
           putStrLn $ renderDoc $ reportFailure e path
+          pure Nothing
+        Left (StoreContextError message) -> do
+          putStrLn $ renderDoc $ reportFailure message path
           pure Nothing
         Left (WarningError report) -> do
           putStrLn $ renderDoc $ ppInteractive report path

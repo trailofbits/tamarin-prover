@@ -10,8 +10,8 @@ module Theory.Constraint.Solver.TreeExport
   ) where
 
 import           Theory.Constraint.Solver.ProofMethod (ProofMethod (..), Result (..))
-import           Theory.Constraint.Solver.Store       (Kind (..), LemmaMetadata (..),
-                                                        LemmaRoot (..), MethodEdge (..),
+import           Theory.Constraint.Solver.Store       (Kind (..), LemmaRoot (..),
+                                                        MethodEdge (..),
                                                         Ref, StoredRecord (..),
                                                         decodeStoredRecord, readStoreRecords,
                                                         refText, valueRef, writeStoreJSON)
@@ -51,12 +51,6 @@ writeLemmaTrees storeDirectory storedRecords = mapM writeLemmaTree lemmaRoots
       | methodEdge <- decodeRecords KMethodEdge storedRecords
       ]
 
-    lemmaMetadataByName :: Map.Map String LemmaMetadata
-    lemmaMetadataByName = Map.fromList
-      [ (metadata.lmLemma, metadata)
-      | metadata <- decodeRecords KLemmaMetadata storedRecords
-      ]
-
     storedSystemRefs :: Set.Set Ref
     storedSystemRefs = Set.fromList
       [ record.storedKey
@@ -67,16 +61,13 @@ writeLemmaTrees storeDirectory storedRecords = mapM writeLemmaTree lemmaRoots
     writeLemmaTree :: LemmaRoot -> IO FilePath
     writeLemmaTree lemmaRoot = do
         let (rootJSON, proofStatus) =
-                buildTreeNode storedSystemRefs methodEdgesBySystem
-                              Set.empty lemmaRoot.lrRoot
-            quantifier = case Map.lookup lemmaRoot.lrLemma lemmaMetadataByName of
-              Nothing       -> "unknown"
-              Just metadata -> quantifierText metadata.lmTraceQuantifier
+              buildTreeNode storedSystemRefs methodEdgesBySystem
+                            Set.empty lemmaRoot.lrRoot
             treePath = storeDirectory
                        </> (sanitizeFileName lemmaRoot.lrLemma ++ ".tree.json")
         JSON.encodeFile treePath $ object
           [ "lemma"      .= lemmaRoot.lrLemma
-          , "quantifier" .= quantifier
+          , "quantifier" .= quantifierText lemmaRoot.lrTraceQuantifier
           , "status"     .= exportStatusText proofStatus
           , "root"       .= rootJSON
           ]

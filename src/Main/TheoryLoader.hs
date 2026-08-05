@@ -58,6 +58,12 @@ import Text.Parsec (ParseError)
 import Text.Read (readEither)
 import Theory hiding (closeTheory, transReport)
 import Theory.Module
+import Theory.Constraint.Solver.Store
+  ( Kind (KTheoryContext),
+    Ref,
+    setTheoryContext,
+    valueRef,
+  )
 import Theory.Text.Parser (diffTheory, parseIntruderRules, theory)
 import Theory.Text.Parser.Token
 import Theory.Text.Pretty qualified as Pretty
@@ -402,10 +408,12 @@ lemmaSelector thyOpts lem
 data TheoryLoadError
   = ParserError ParseError
   | WarningError WfErrorReport
+  | StoreContextError String
 
 instance Show TheoryLoadError where
   show (ParserError e) = show e
   show (WarningError e) = Pretty.render (prettyWfErrorReport e)
+  show (StoreContextError e) = e
 
 -- | Load an open theory from a string with the given options.
 loadTheory ::
@@ -577,7 +585,7 @@ withVersionAndReport version thyOpts report thy = do
 
 -- | Close a translated theory.
 closeTranslatedTheory
-  :: (MonadError TheoryLoadError m)
+  :: (MonadIO m, MonadError TheoryLoadError m)
   => TheoryLoadOptions
   -> SignatureWithMaude
   -> Either OpenTranslatedTheory OpenDiffTheory
@@ -597,7 +605,22 @@ closeTranslatedTheory thyOpts sign srcThy = do
               (applyPartialEvaluationDiff style autoSources)
               closedThy
           Nothing -> closedThy
-      provedThy =
+
+  evictionContextMatches <- case thyOpts.evictDir of
+      Nothing ->
+        pure True
+      Just _ -> case partialThy of
+        Left closedTheory ->
+          liftIO $ setTheoryContext (theoryContextFingerprint thyOpts closedTheory)
+        Right _ ->
+          -- Diff-theory eviction is currently unsupported
+          pure True
+
+  unless evictionContextMatches $
+    throwError $ StoreContextError
+      "eviction store belongs to a different theory; use a fresh --evict directory"
+
+  let provedThy =
         bimap
           (proveTheory selector prover)
           (proveDiffTheory selector prover diffProver)
@@ -623,6 +646,24 @@ closeTranslatedTheory thyOpts sign srcThy = do
     withDiffTheory = bitraverse pure
 
     theoryName = either (._thyName) (._diffThyName)
+
+-- | Fingerprint everything a stored proof step's validity depends on. Lemma
+-- formulas are checked separately through their root-system references.
+theoryContextFingerprint :: TheoryLoadOptions -> ClosedTheory -> Ref
+theoryContextFingerprint thyOpts closedTheory =
+  valueRef KTheoryContext
+    ( "theory-context-v1" :: String
+    , ruleCache._crcRules
+    , ruleCache._crcRawSources
+    , ruleCache._crcRefinedSources
+    , ruleCache._crcInjectiveFactInsts
+    , toSignaturePure closedTheory._thySignature
+    , constructAutoProver thyOpts
+    , closedTheory._thyHeuristic
+    , closedTheory._thyTactic
+    )
+  where
+    ruleCache = closedTheory._thyCache
 
 -- | Translate an open theory, perform checks on the translated theory and finally close it.
 closeTheory ::
