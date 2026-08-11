@@ -1183,13 +1183,18 @@ solveAndStore heuristic tactics ctxt depth parentRef systemRef = do
     system <- loadSystemFromRef systemRef
     let (method, cases) = nextProofStep heuristic tactics ctxt depth system
 
-    -- Store each child as it is evaluated, retaining only its on-disk Ref.
+    -- Frontier eviction: each child is written so that its Ref is available for
+    -- the method edge, but the System is kept alongside the Ref. Descending into
+    -- a child therefore costs no read. Memory grows with the unexplored
+    -- frontier rather than with the whole tree.
     casesWithRefs <- mapM storeCase cases
 
     storeProofStep parentRef method (M.map getStoredRef casesWithRefs)
     pure (parentRef, method, casesWithRefs)
   where
-    storeCase system = OnDisk <$> storeSystem system
+    storeCase system = do
+        ref <- storeSystem system
+        pure (StoredInMem ref system)
 
 getStoredRef :: SystemRef -> Ref
 getStoredRef (StoredInMem ref _) = ref
